@@ -1,0 +1,38 @@
+[s3]
+bucket = "your-gb300-relay-bucket"
+prefix = "gb300-relay/v1"
+endpoint_url = "https://object-store.example.com"
+region = "us-east-1"
+profile = "gb300-relay"
+credentials_file = "/etc/gb300-relay/aws-credentials"
+s5cmd_path = "/opt/gb300-s3-relay/.tools/s5cmd"
+addressing_style = "path"
+verify_tls = true
+retry_count = 10
+max_pool_connections = 128
+
+[worker]
+target = "gb300-1"
+worker_id = "gb300-1-worker-1"
+upstream_base_url = "http://127.0.0.1:8080"
+max_concurrency = 16
+asset_transfer_concurrency = 8
+lease_seconds = 1800
+lease_heartbeat_seconds = 60
+worker_heartbeat_seconds = 10
+job_timeout_seconds = 1500
+max_attempts = 3
+retry_base_seconds = 1
+work_dir = "/var/tmp/gb300-relay"
+# Use data_uri when the model server cannot read files created by the worker account.
+media_delivery = "auto"
+inline_image_max_bytes = 33554432
+max_response_bytes = 536870912
+stream_chunk_bytes = 262144
+stream_flush_interval_seconds = 0.5
+models = []
+
+[metrics]
+enabled = true
+host = "127.0.0.1"
+port = 9108

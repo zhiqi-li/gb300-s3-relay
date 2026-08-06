@@ -1,0 +1,21 @@
+[Unit]
+Description=GB300 S3 Relay OpenAI gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gb300-relay
+Group=gb300-relay
+WorkingDirectory=/opt/gb300-s3-relay
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/gb300-relay/relay.env
+ExecStart=/opt/gb300-s3-relay/.venv/bin/gb300-relay gateway --config /etc/gb300-relay/osmo-gateway.toml
+Restart=always
+RestartSec=5
+TimeoutStopSec=330
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

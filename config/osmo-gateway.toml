@@ -1,0 +1,48 @@
+[s3]
+bucket = "your-gb300-relay-bucket"
+prefix = "gb300-relay/v1"
+endpoint_url = "https://object-store.example.com"
+region = "us-east-1"
+profile = "gb300-relay"
+credentials_file = "/etc/gb300-relay/aws-credentials"
+s5cmd_path = "../.tools/s5cmd"
+addressing_style = "path"
+verify_tls = true
+retry_count = 10
+max_pool_connections = 128
+
+[gateway]
+host = "127.0.0.1"
+port = 8080
+targets = ["gb300-1", "gb300-2"]
+default_timeout_seconds = 900
+max_timeout_seconds = 7200
+target_heartbeat_ttl_seconds = 45
+require_healthy_worker = true
+cleanup_on_success = true
+cleanup_idempotent_on_success = false
+max_json_body_bytes = 1073741824
+# Set this to an environment-variable name when binding beyond loopback.
+# auth_token_env = "GB300_RELAY_GATEWAY_TOKEN"
+
+[gateway.media]
+max_request_bytes = 8589934592
+max_asset_bytes = 6442450944
+max_assets = 64
+max_inline_data_uri_bytes = 536870912
+materialize_data_urls = true
+allow_file_urls = false
+allowed_file_roots = []
+materialize_http_urls = false
+allowed_http_hosts = []
+
+[metrics]
+enabled = true
+host = "127.0.0.1"
+port = 9108
+
+[retention]
+succeeded_seconds = 86400
+failed_seconds = 604800
+require_acknowledgement = true
+stale_worker_heartbeat_seconds = 3600

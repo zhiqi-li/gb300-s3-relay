@@ -1,0 +1,22 @@
+[Unit]
+Description=GB300 S3 Relay worker (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gb300-relay
+Group=gb300-relay
+WorkingDirectory=/opt/gb300-s3-relay
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/gb300-relay/relay.env
+ExecStart=/opt/gb300-s3-relay/.venv/bin/gb300-relay worker --config /etc/gb300-relay/%i.toml
+Restart=always
+RestartSec=5
+TimeoutStopSec=330
+NoNewPrivileges=true
+# file_uri delivery requires the model server to see the worker's work directory.
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

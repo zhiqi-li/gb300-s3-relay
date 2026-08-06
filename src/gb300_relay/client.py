@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import tempfile
+import time
+import uuid
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from .config import GatewayConfig, MediaPolicy
+from .errors import ConditionalWriteFailed, IntegrityError, InvalidRequestError, RelayError
+from .layout import ObjectLayout
+from .media import MediaMaterializer
+from .protocol import (
+    AckMarker,
+    DoneMarker,
+    JobHandle,
+    JobStatus,
+    ReadyMarker,
+    RelayRequest,
+    RelayResponse,
+    canonical_json_bytes,
+    sha256_bytes,
+)
+from .storage import ObjectStore, sha256_file
+
+_TERMINAL_SSE_MARKERS = (
+    b"data:[DONE]",
+    b'"type":"response.completed"',
+    b'"type":"response.failed"',
+    b'"type":"response.incomplete"',
+    b"event:response.completed",
+    b"event:response.failed",
+    b"event:response.incomplete",
+)
+
+
+def _contains_terminal_sse_event(data: bytes) -> bool:
+    compact = b"".join(data.split()).lower()
+    return any(marker.lower() in compact for marker in _TERMINAL_SSE_MARKERS)
+
+
+class JobFailedError(RelayError):
+    def __init__(self, response: RelayResponse, body: bytes) -> None:
+        message = response.failure.message if response.failure else "relay job failed"
+        super().__init__(message)
+        self.response = response
+        self.body = body
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedJob:
+    metadata: RelayResponse
+    body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class JobStatusView:
+    job_id: str
+    state: str
+    done: DoneMarker | None = None
+
+
+class RelayClient:
+    def __init__(
+        self,
+        store: ObjectStore,
+        *,
+        prefix: str,
+        client_id: str = "relay-client",
+        media_policy: MediaPolicy | None = None,
+        poll_interval_seconds: float = 0.5,
+        upload_concurrency: int = 8,
+    ) -> None:
+        self.store = store
+        self.layout = ObjectLayout(prefix)
+        self.client_id = client_id
+        self.media_policy = media_policy or MediaPolicy()
+        self.poll_interval_seconds = poll_interval_seconds
+        self.upload_concurrency = max(1, upload_concurrency)
+
+    def _job_id(self, target: str, idempotency_key: str | None) -> tuple[str, str | None]:
+        if idempotency_key is None:
+            return f"job-{uuid.uuid4().hex}", None
+        if not idempotency_key or len(idempotency_key.encode("utf-8")) > 1_024:
+            raise InvalidRequestError("idempotency key must be between 1 and 1024 bytes")
+        digest = hashlib.sha256(f"{target}\0{idempotency_key}".encode()).hexdigest()
+        return f"idem-{digest[:48]}", digest
+
+    @staticmethod
+    def _equivalence_payload(request: RelayRequest) -> dict[str, Any]:
+        value = request.model_dump(mode="json")
+        for field in ("created_at", "expires_at", "trace_id"):
+            value.pop(field, None)
+        return value
+
+    def _load_request(self, target: str, job_id: str) -> RelayRequest | None:
+        key = self.layout.manifest(target, job_id)
+        if self.store.head(key) is None:
+            return None
+        return RelayRequest.model_validate_json(self.store.get_bytes(key, max_bytes=16 * 1024**2))
+
+    def submit(
+        self,
+        *,
+        endpoint: str,
+        body: dict[str, Any],
+        target: str,
+        timeout_seconds: float = 900,
+        idempotency_key: str | None = None,
+        stream: bool | None = None,
+        forwarded_headers: dict[str, str] | None = None,
+    ) -> JobHandle:
+        if timeout_seconds <= 0:
+            raise InvalidRequestError("timeout_seconds must be positive")
+        job_id, idempotency_hash = self._job_id(target, idempotency_key)
+        existing = self._load_request(target, job_id) if idempotency_key is not None else None
+        trace_id = f"trace-{uuid.uuid4().hex}"
+        now = datetime.now(UTC)
+        with tempfile.TemporaryDirectory(prefix=f"gb300-relay-submit-{job_id}-") as raw_directory:
+            assets_directory = Path(raw_directory) / "assets"
+            materialized = MediaMaterializer(self.media_policy).materialize(body, assets_directory)
+            request = RelayRequest(
+                job_id=job_id,
+                target=target,
+                endpoint=endpoint,
+                created_at=now,
+                expires_at=now + timedelta(seconds=timeout_seconds),
+                trace_id=trace_id,
+                idempotency_key_hash=idempotency_hash,
+                stream=bool(materialized.body.get("stream", False) if stream is None else stream),
+                body=materialized.body,
+                assets=materialized.descriptors,
+                forwarded_headers=forwarded_headers or {},
+            )
+            if existing is not None:
+                if self._equivalence_payload(existing) != self._equivalence_payload(request):
+                    raise InvalidRequestError(
+                        "idempotency key was already used for a different request"
+                    )
+                request = existing
+
+            def upload(descriptor) -> None:
+                self.store.upload_file(
+                    materialized.paths[descriptor.asset_id],
+                    self.layout.asset(target, job_id, descriptor.object_name),
+                )
+
+            if request.assets:
+                with ThreadPoolExecutor(
+                    max_workers=min(self.upload_concurrency, len(request.assets))
+                ) as executor:
+                    list(executor.map(upload, request.assets))
+
+            manifest_data = canonical_json_bytes(request.model_dump(mode="json"))
+            manifest_key = self.layout.manifest(target, job_id)
+            if existing is None:
+                try:
+                    self.store.put_bytes(
+                        manifest_key,
+                        manifest_data,
+                        content_type="application/json",
+                        if_absent=True,
+                    )
+                except ConditionalWriteFailed as exc:
+                    winner = self._load_request(target, job_id)
+                    if winner is None or self._equivalence_payload(
+                        winner
+                    ) != self._equivalence_payload(request):
+                        raise InvalidRequestError(
+                            "idempotent submission raced with a different request"
+                        ) from exc
+                    request = winner
+                    manifest_data = canonical_json_bytes(request.model_dump(mode="json"))
+
+            ready = ReadyMarker(
+                job_id=request.job_id,
+                target=request.target,
+                manifest_sha256=sha256_bytes(manifest_data),
+            )
+            try:
+                self.store.put_bytes(
+                    self.layout.ready(target, job_id),
+                    canonical_json_bytes(ready.model_dump(mode="json")),
+                    content_type="application/json",
+                    if_absent=True,
+                )
+            except ConditionalWriteFailed as exc:
+                current = ReadyMarker.model_validate_json(
+                    self.store.get_bytes(self.layout.ready(target, job_id), max_bytes=64 * 1024)
+                )
+                if current.manifest_sha256 != ready.manifest_sha256:
+                    raise IntegrityError(
+                        "READY marker does not match the request manifest"
+                    ) from exc
+            return JobHandle(
+                job_id=request.job_id,
+                target=request.target,
+                trace_id=request.trace_id,
+                submitted_at=request.created_at,
+                expires_at=request.expires_at,
+            )
+
+    def status(self, job_id: str) -> JobStatusView:
+        key = self.layout.done(job_id)
+        if self.store.head(key) is None:
+            return JobStatusView(job_id=job_id, state="PENDING")
+        done = DoneMarker.model_validate_json(self.store.get_bytes(key, max_bytes=64 * 1024))
+        return JobStatusView(job_id=job_id, state=done.status.value, done=done)
+
+    def _read_completed(self, job_id: str, directory: Path) -> CompletedJob:
+        done_data = self.store.get_bytes(self.layout.done(job_id), max_bytes=64 * 1024)
+        done = DoneMarker.model_validate_json(done_data)
+        metadata_data = self.store.get_bytes(
+            self.layout.response_metadata(job_id), max_bytes=4 * 1024**2
+        )
+        if sha256_bytes(metadata_data) != done.response_sha256:
+            raise IntegrityError(f"response metadata digest mismatch for {job_id}")
+        metadata = RelayResponse.model_validate_json(metadata_data)
+        body_path = directory / "response.body"
+        self.store.download_file(metadata.body_object, body_path)
+        if body_path.stat().st_size != metadata.body_size_bytes:
+            raise IntegrityError(f"response body size mismatch for {job_id}")
+        if sha256_file(body_path) != metadata.body_sha256:
+            raise IntegrityError(f"response body digest mismatch for {job_id}")
+        return CompletedJob(metadata=metadata, body=body_path.read_bytes())
+
+    def wait(
+        self,
+        handle: JobHandle | str,
+        *,
+        timeout_seconds: float | None = None,
+        cleanup: bool = False,
+        raise_on_failure: bool = False,
+    ) -> CompletedJob:
+        job_id = handle.job_id if isinstance(handle, JobHandle) else handle
+        target = handle.target if isinstance(handle, JobHandle) else None
+        deadline = time.monotonic() + (
+            timeout_seconds
+            if timeout_seconds is not None
+            else max(0.0, (handle.expires_at - datetime.now(UTC)).total_seconds())
+            if isinstance(handle, JobHandle)
+            else 900.0
+        )
+        while self.store.head(self.layout.done(job_id)) is None:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for relay job {job_id}")
+            time.sleep(self.poll_interval_seconds)
+        with tempfile.TemporaryDirectory(prefix=f"gb300-relay-result-{job_id}-") as directory:
+            completed = self._read_completed(job_id, Path(directory))
+        if target is None:
+            target = completed.metadata.target
+        self.acknowledge(job_id)
+        if cleanup:
+            self.cleanup(target=target, job_id=job_id)
+        if raise_on_failure and completed.metadata.status != JobStatus.SUCCEEDED:
+            raise JobFailedError(completed.metadata, completed.body)
+        return completed
+
+    async def aiter_stream(
+        self,
+        handle: JobHandle,
+        *,
+        timeout_seconds: float | None = None,
+        cleanup: bool = False,
+    ) -> AsyncIterator[bytes]:
+        deadline = time.monotonic() + (
+            timeout_seconds
+            if timeout_seconds is not None
+            else max(0.0, (handle.expires_at - datetime.now(UTC)).total_seconds())
+        )
+        next_sequence = 0
+        done: DoneMarker | None = None
+        terminal_probe = b""
+        held_terminal_chunks: list[bytes] = []
+        terminal_seen = False
+        while True:
+            if done is None:
+                done_key = self.layout.done(handle.job_id)
+                if await asyncio.to_thread(self.store.head, done_key) is not None:
+                    raw = await asyncio.to_thread(self.store.get_bytes, done_key)
+                    done = DoneMarker.model_validate_json(raw)
+            objects = await asyncio.to_thread(
+                self.store.list, self.layout.stream_prefix(handle.job_id)
+            )
+            chunks: dict[int, str] = {}
+            for item in objects:
+                leaf = item.key.rsplit("/", 1)[-1]
+                if not leaf.endswith(".sse") or not leaf[:-4].isdigit():
+                    continue
+                chunks[int(leaf[:-4])] = item.key
+            while next_sequence in chunks:
+                data = await asyncio.to_thread(self.store.get_bytes, chunks[next_sequence])
+                next_sequence += 1
+                terminal_probe = (terminal_probe + data)[-8192:]
+                terminal_seen = terminal_seen or _contains_terminal_sse_event(terminal_probe)
+                is_known_final = (
+                    done is not None
+                    and done.stream_chunk_count is not None
+                    and next_sequence >= done.stream_chunk_count
+                )
+                if terminal_seen or is_known_final:
+                    held_terminal_chunks.append(data)
+                else:
+                    yield data
+            if done is not None:
+                expected = done.stream_chunk_count or 0
+                if next_sequence >= expected:
+                    await asyncio.to_thread(self.acknowledge, handle.job_id)
+                    if cleanup and done.status == JobStatus.SUCCEEDED:
+                        await asyncio.to_thread(
+                            self.cleanup, target=handle.target, job_id=handle.job_id
+                        )
+                    for data in held_terminal_chunks:
+                        yield data
+                    break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out streaming relay job {handle.job_id}")
+            await asyncio.sleep(self.poll_interval_seconds)
+
+    def acknowledge(self, job_id: str) -> None:
+        marker = AckMarker(job_id=job_id, client_id=self.client_id)
+        try:
+            self.store.put_bytes(
+                self.layout.ack(job_id),
+                canonical_json_bytes(marker.model_dump(mode="json")),
+                content_type="application/json",
+                if_absent=True,
+            )
+        except ConditionalWriteFailed:
+            return
+
+    def cancel(self, job_id: str) -> None:
+        payload = canonical_json_bytes(
+            {
+                "schema_version": "1.0",
+                "job_id": job_id,
+                "client_id": self.client_id,
+                "cancelled_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        try:
+            self.store.put_bytes(
+                self.layout.cancel(job_id),
+                payload,
+                content_type="application/json",
+                if_absent=True,
+            )
+        except ConditionalWriteFailed:
+            return
+
+    def cleanup(self, *, target: str, job_id: str) -> int:
+        removed = 0
+        for prefix in self.layout.job_cleanup_prefixes(target, job_id):
+            removed += self.store.delete_prefix(prefix)
+        self.store.delete_keys(
+            (
+                self.layout.ack(job_id),
+                self.layout.cancel(job_id),
+                self.layout.deadletter(target, job_id),
+            )
+        )
+        return removed
+
+
+def client_from_gateway_config(
+    store: ObjectStore, prefix: str, config: GatewayConfig
+) -> RelayClient:
+    return RelayClient(
+        store,
+        prefix=prefix,
+        client_id=config.client_id,
+        media_policy=config.media,
+        poll_interval_seconds=config.poll_interval_seconds,
+    )

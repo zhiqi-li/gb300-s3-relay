@@ -8,6 +8,7 @@ import signal
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
@@ -124,6 +125,13 @@ def _run_gateway(config: AppConfig, host: str | None, port: int | None) -> int:
 async def _run_worker_async(config: AppConfig, once: bool) -> int:
     if config.worker is None:
         raise RelayError("config has no [worker] section")
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=config.worker.thread_pool_workers,
+            thread_name_prefix="gb300-worker-io",
+        )
+    )
     metrics = RelayMetrics("worker")
     if config.metrics.enabled:
         metrics.start_server(config.metrics.host, config.metrics.port)
@@ -154,7 +162,6 @@ async def _run_worker_async(config: AppConfig, once: bool) -> int:
         finally:
             await worker.upstream.close()
             store.close()
-    loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         with suppress(NotImplementedError):
             loop.add_signal_handler(signum, worker.stop)

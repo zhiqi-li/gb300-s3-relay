@@ -7,6 +7,8 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -166,7 +168,21 @@ def create_app(
     prefix: str,
     metrics: RelayMetrics | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="GB300 S3 Relay", version="0.2.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(
+            max_workers=config.thread_pool_workers,
+            thread_name_prefix="gb300-gateway-io",
+        )
+        loop.set_default_executor(executor)
+        app.state.io_executor = executor
+        try:
+            yield
+        finally:
+            executor.shutdown(wait=True)
+
+    app = FastAPI(title="GB300 S3 Relay", version="0.2.0", lifespan=lifespan)
     layout = ObjectLayout(prefix)
     selector = TargetSelector(store, layout, config)
     relay_metrics = metrics or RelayMetrics("gateway")

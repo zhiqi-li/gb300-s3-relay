@@ -19,6 +19,7 @@ upstream_base_url = "http://127.0.0.1:8080"
 max_concurrency = 64
 max_heavy_concurrency = 8
 heavy_request_threshold_bytes = 131072
+thread_pool_workers = 128
 asset_transfer_concurrency = 8
 poll_interval_seconds = 0.1
 poll_jitter_seconds = 0.1

@@ -37,6 +37,8 @@ Worker admission has two limits. `max_concurrency` controls all in-flight jobs, 
 `max_heavy_concurrency` separately bounds requests that contain assets or whose serialized body
 exceeds `heavy_request_threshold_bytes`. This permits high short-text concurrency without
 allowing a burst of long-context or multimodal requests to exhaust KV cache.
+`thread_pool_workers` sizes the blocking object-store I/O executor independently of model
+admission; keep it at least as large as `max_concurrency` for bursty workloads.
 
 ## Quick start
 

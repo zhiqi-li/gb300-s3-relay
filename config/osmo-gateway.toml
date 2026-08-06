@@ -25,6 +25,7 @@ cleanup_on_success = true
 cleanup_idempotent_on_success = false
 compact_protocol = true
 compact_manifest_max_bytes = 1048576
+thread_pool_workers = 128
 max_json_body_bytes = 1073741824
 # Set this to an environment-variable name when binding beyond loopback.
 # auth_token_env = "GB300_RELAY_GATEWAY_TOKEN"

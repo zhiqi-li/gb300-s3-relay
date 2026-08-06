@@ -339,14 +339,6 @@ class RelayWorker:
                 ),
             )
             return ProcessOutcome(job_id, handled=False)
-        if await asyncio.to_thread(self._is_done, job_id):
-            await asyncio.to_thread(
-                self.store.delete_prefix,
-                self.layout.claim_generation_prefix(
-                    token.target, token.job_id, token.generation
-                ),
-            )
-            return ProcessOutcome(job_id, handled=False)
         started = time.monotonic()
         lost = asyncio.Event()
         heartbeat = asyncio.create_task(self._lease_heartbeat_loop(token, lost))
@@ -373,7 +365,7 @@ class RelayWorker:
                         compact_response=ready.compact_response,
                     )
                     return ProcessOutcome(job_id, handled=True, status=status)
-                if await asyncio.to_thread(self._is_cancelled, job_id):
+                if request.stream and await asyncio.to_thread(self._is_cancelled, job_id):
                     status = await self._publish_error(
                         request,
                         token,

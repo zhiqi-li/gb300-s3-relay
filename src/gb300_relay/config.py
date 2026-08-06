@@ -79,6 +79,7 @@ class GatewayConfig(ConfigModel):
     cleanup_idempotent_on_success: bool = False
     compact_protocol: bool = False
     compact_manifest_max_bytes: int = Field(default=1024**2, ge=0, le=16 * 1024**2)
+    thread_pool_workers: int = Field(default=128, ge=4, le=1_024)
     max_json_body_bytes: int = Field(default=1024**3, ge=1, le=16 * 1024**3)
     auth_token_env: str | None = None
     client_id: str = Field(default_factory=lambda: f"gateway-{socket.gethostname()}-{os.getpid()}")
@@ -107,6 +108,7 @@ class WorkerConfig(ConfigModel):
     max_concurrency: int = Field(default=8, ge=1, le=1_024)
     max_heavy_concurrency: int = Field(default=8, ge=1, le=1_024)
     heavy_request_threshold_bytes: int = Field(default=128 * 1024, ge=1, le=1024**3)
+    thread_pool_workers: int = Field(default=128, ge=4, le=1_024)
     asset_transfer_concurrency: int = Field(default=8, ge=1, le=128)
     poll_interval_seconds: float = Field(default=0.5, gt=0, le=60)
     poll_jitter_seconds: float = Field(default=0.25, ge=0, le=60)

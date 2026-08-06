@@ -84,6 +84,43 @@ def client(store: MemoryObjectStore) -> RelayClient:
 
 
 class ClientWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compact_protocol_uses_ready_and_done_as_complete_commits(self) -> None:
+        store = MemoryObjectStore()
+        relay = RelayClient(
+            store,
+            prefix="relay/v1",
+            media_policy=MediaPolicy(),
+            poll_interval_seconds=0.001,
+            compact_protocol=True,
+        )
+        handle = relay.submit(
+            endpoint="/v1/chat/completions",
+            body={"model": "m", "messages": [{"role": "user", "content": "short"}]},
+            target="gb300-1",
+            timeout_seconds=30,
+        )
+        self.assertFalse(store.list(f"relay/v1/requests/gb300-1/{handle.job_id}/manifest.json"))
+        with tempfile.TemporaryDirectory() as directory:
+            worker = RelayWorker(
+                store,
+                prefix="relay/v1",
+                config=WorkerConfig(
+                    target="gb300-1",
+                    worker_id="worker-1",
+                    work_dir=Path(directory),
+                    lease_seconds=30,
+                    lease_heartbeat_seconds=5,
+                ),
+                upstream=FakeUpstream(),
+            )
+            outcome = await worker.process(handle.job_id)
+        self.assertEqual(outcome.status, JobStatus.SUCCEEDED)
+        result_keys = [item.key for item in store.list(f"relay/v1/results/{handle.job_id}/")]
+        self.assertEqual(result_keys, [f"relay/v1/results/{handle.job_id}/DONE.json"])
+        completed = relay.wait(handle, timeout_seconds=1)
+        self.assertEqual(completed.metadata.status, JobStatus.SUCCEEDED)
+        self.assertEqual(json.loads(completed.body)["object"], "chat.completion")
+
     async def test_multimodal_round_trip(self) -> None:
         store = MemoryObjectStore()
         relay = client(store)
@@ -165,6 +202,37 @@ class ClientWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(upstream.max_active, 2)
         self.assertLessEqual(upstream.max_active, 4)
 
+    async def test_heavy_request_concurrency_has_a_separate_bound(self) -> None:
+        store = MemoryObjectStore()
+        relay = client(store)
+        for index in range(8):
+            relay.submit(
+                endpoint="/v1/chat/completions",
+                body={"model": "m", "messages": [{"role": "user", "content": str(index)}]},
+                target="gb300-1",
+                timeout_seconds=30,
+            )
+        upstream = FakeUpstream(delay=0.02)
+        with tempfile.TemporaryDirectory() as directory:
+            worker = RelayWorker(
+                store,
+                prefix="relay/v1",
+                config=WorkerConfig(
+                    target="gb300-1",
+                    worker_id="worker-1",
+                    work_dir=Path(directory),
+                    max_concurrency=8,
+                    max_heavy_concurrency=2,
+                    heavy_request_threshold_bytes=1,
+                    lease_seconds=30,
+                    lease_heartbeat_seconds=5,
+                ),
+                upstream=upstream,
+            )
+            outcomes = await worker.run_until_idle()
+        self.assertEqual(len(outcomes), 8)
+        self.assertEqual(upstream.max_active, 2)
+
     async def test_two_workers_do_not_process_same_job(self) -> None:
         store = MemoryObjectStore()
         handle = client(store).submit(
@@ -197,6 +265,33 @@ class ClientWorkerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(sum(item.handled for item in outcomes), 1)
         self.assertEqual(first_upstream.calls + second_upstream.calls, 1)
+
+    async def test_stale_ready_discovery_does_not_leave_an_orphan_claim(self) -> None:
+        store = MemoryObjectStore()
+        relay = client(store)
+        handle = relay.submit(
+            endpoint="/v1/chat/completions",
+            body={"model": "m", "messages": []},
+            target="gb300-1",
+            timeout_seconds=30,
+        )
+        store.delete_prefix(f"relay/v1/requests/gb300-1/{handle.job_id}/")
+        with tempfile.TemporaryDirectory() as directory:
+            worker = RelayWorker(
+                store,
+                prefix="relay/v1",
+                config=WorkerConfig(
+                    target="gb300-1",
+                    worker_id="worker-1",
+                    work_dir=Path(directory),
+                    lease_seconds=30,
+                    lease_heartbeat_seconds=5,
+                ),
+                upstream=FakeUpstream(),
+            )
+            outcome = await worker.process(handle.job_id, discovered=True)
+        self.assertFalse(outcome.handled)
+        self.assertFalse(store.list(f"relay/v1/claims/gb300-1/{handle.job_id}/"))
 
     async def test_retries_retryable_upstream_status(self) -> None:
         store = MemoryObjectStore()

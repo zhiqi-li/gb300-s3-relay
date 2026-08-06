@@ -53,9 +53,18 @@ class ObjectStore(Protocol):
 
     def get_bytes(self, key: str, *, max_bytes: int | None = None) -> bytes: ...
 
-    def upload_file(self, local_path: Path, key: str) -> ObjectInfo: ...
+    def upload_file(
+        self, local_path: Path, key: str, *, force_s5cmd: bool = False
+    ) -> ObjectInfo: ...
 
-    def download_file(self, key: str, local_path: Path) -> ObjectInfo: ...
+    def download_file(
+        self,
+        key: str,
+        local_path: Path,
+        *,
+        expected_size_bytes: int | None = None,
+        force_s5cmd: bool = False,
+    ) -> ObjectInfo: ...
 
     def head(self, key: str) -> ObjectInfo | None: ...
 
@@ -204,14 +213,31 @@ class S3ObjectStore:
             raise IntegrityError(f"object {key} exceeds {max_bytes} bytes")
         return data
 
-    def upload_file(self, local_path: Path, key: str) -> ObjectInfo:
+    def upload_file(
+        self, local_path: Path, key: str, *, force_s5cmd: bool = False
+    ) -> ObjectInfo:
         path = Path(local_path)
         if not path.is_file():
             raise StorageError(f"upload source is not a file: {path}")
+        size = path.stat().st_size
+        if not force_s5cmd and size <= self.config.native_transfer_max_bytes:
+            try:
+                with path.open("rb") as body:
+                    response = self._client.put_object(Bucket=self.bucket, Key=key, Body=body)
+            except (OSError, BotoCoreError, ClientError) as exc:
+                raise StorageError(f"PUT failed for s3://{self.bucket}/{key}: {exc}") from exc
+            return ObjectInfo(key=key, size=size, etag=response.get("ETag"))
         self._s5cmd.copy(str(path), self.uri(key))
-        return ObjectInfo(key=key, size=path.stat().st_size)
+        return ObjectInfo(key=key, size=size)
 
-    def download_file(self, key: str, local_path: Path) -> ObjectInfo:
+    def download_file(
+        self,
+        key: str,
+        local_path: Path,
+        *,
+        expected_size_bytes: int | None = None,
+        force_s5cmd: bool = False,
+    ) -> ObjectInfo:
         destination = Path(local_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -219,8 +245,28 @@ class S3ObjectStore:
         ) as handle:
             temporary = Path(handle.name)
         try:
-            self._s5cmd.copy(self.uri(key), str(temporary))
+            if (
+                not force_s5cmd
+                and expected_size_bytes is not None
+                and expected_size_bytes <= self.config.native_transfer_max_bytes
+            ):
+                try:
+                    response = self._client.get_object(Bucket=self.bucket, Key=key)
+                    body = response["Body"]
+                    try:
+                        with temporary.open("wb") as output:
+                            shutil.copyfileobj(body, output)
+                    finally:
+                        body.close()
+                except (OSError, BotoCoreError, ClientError) as exc:
+                    raise StorageError(f"GET failed for s3://{self.bucket}/{key}: {exc}") from exc
+            else:
+                self._s5cmd.copy(self.uri(key), str(temporary))
             size = temporary.stat().st_size
+            if expected_size_bytes is not None and size != expected_size_bytes:
+                raise IntegrityError(
+                    f"object {key} has {size} bytes, expected {expected_size_bytes}"
+                )
             os.replace(temporary, destination)
         except Exception:
             temporary.unlink(missing_ok=True)
@@ -425,11 +471,26 @@ class MemoryObjectStore:
             raise IntegrityError(f"object {key} exceeds {max_bytes} bytes")
         return bytes(data)
 
-    def upload_file(self, local_path: Path, key: str) -> ObjectInfo:
+    def upload_file(
+        self, local_path: Path, key: str, *, force_s5cmd: bool = False
+    ) -> ObjectInfo:
+        del force_s5cmd
         return self.put_bytes(key, Path(local_path).read_bytes())
 
-    def download_file(self, key: str, local_path: Path) -> ObjectInfo:
+    def download_file(
+        self,
+        key: str,
+        local_path: Path,
+        *,
+        expected_size_bytes: int | None = None,
+        force_s5cmd: bool = False,
+    ) -> ObjectInfo:
+        del force_s5cmd
         data = self.get_bytes(key)
+        if expected_size_bytes is not None and len(data) != expected_size_bytes:
+            raise IntegrityError(
+                f"object {key} has {len(data)} bytes, expected {expected_size_bytes}"
+            )
         path = Path(local_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)

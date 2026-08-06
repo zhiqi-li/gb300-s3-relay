@@ -173,11 +173,40 @@ class LeaseManager:
 
     def assert_owner(self, token: LeaseToken, *, now: datetime | None = None) -> None:
         now = now or datetime.now(UTC)
-        states = self._states(token.target, token.job_id)
-        if not states or max(states) != token.generation:
+        objects = self.store.list(self.layout.claim_job_prefix(token.target, token.job_id))
+        generations = {
+            generation
+            for item in objects
+            if (
+                generation := self.layout.parse_claim_generation(
+                    item.key, token.target, token.job_id
+                )
+            )
+            is not None
+        }
+        if not generations or max(generations) != token.generation:
             raise LeaseLostError(f"worker no longer owns {token.job_id}")
-        state = states[token.generation]
-        if state.claim.worker_id != token.worker_id:
+        claim_key = self.layout.claim(token.target, token.job_id, token.generation)
+        if not any(item.key == claim_key for item in objects):
             raise LeaseLostError(f"worker no longer owns {token.job_id}")
-        if state.is_expired(now, grace_seconds=self.clock_skew_grace_seconds):
+        activity = [
+            item.last_modified
+            for item in objects
+            if self.layout.parse_claim_generation(item.key, token.target, token.job_id)
+            == token.generation
+            and item.last_modified is not None
+        ]
+        if not activity:
+            # Stores used by tests or adapters may not expose server timestamps.
+            # Fall back to the fully validated representation in that case.
+            states = self._states(token.target, token.job_id)
+            state = states.get(token.generation)
+            if state is None or state.claim.worker_id != token.worker_id:
+                raise LeaseLostError(f"worker no longer owns {token.job_id}")
+            last_activity = state.last_server_activity
+        else:
+            last_activity = max(activity)
+        if now >= last_activity + timedelta(
+            seconds=token.lease_seconds + self.clock_skew_grace_seconds
+        ):
             raise LeaseLostError(f"lease expired for {token.job_id}")

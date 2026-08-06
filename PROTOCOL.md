@@ -20,9 +20,16 @@ workers/<target>/<worker>.json
 
 ## Visibility and commit markers
 
-A worker consumes only a request with a valid `READY.json`. A client consumes only a response with a valid `DONE.json`. Each marker contains the SHA-256 digest of the preceding JSON object, so visibility of a valid marker represents a complete and verifiable stage commit.
+A worker consumes only a request with a valid `READY.json`. A client consumes only a response with a valid `DONE.json`. Each marker contains the SHA-256 digest of the committed metadata, so visibility of a valid marker represents a complete and verifiable stage commit.
 
 The client uploads assets before the manifest and creates `READY.json` last. The worker uploads the response body and any stream chunks before response metadata and creates `DONE.json` last.
+
+When the client opts into the compact protocol, `READY.json.manifest_base64` carries a small
+canonical request manifest and the separate `manifest.json` object is omitted. When that marker
+also requests a compact response and the body fits the worker threshold,
+`DONE.json.response.body_base64` carries the body and the separate response body and
+`response.json` objects are omitted. Both embedded forms retain byte length and SHA-256 checks.
+Oversized manifests and responses fall back independently to the standard object sequence.
 
 ## Claims, takeover, and fencing
 
@@ -41,6 +48,7 @@ The object store and the model call cannot form one exactly-once transaction. A 
 - Manifests and response metadata use canonical JSON and SHA-256 digests.
 - Assets and response bodies carry byte length and SHA-256 metadata.
 - Downloads are written to a partial path and atomically renamed after transfer.
+- Small files use the persistent SDK connection; large files retain the s5cmd data path.
 - Object path segments, filenames, endpoints, and forwarded headers are constrained.
 - `Authorization`, `Cookie`, and `Proxy-Authorization` are never written to request manifests.
 - Explicit relay credentials override ambient cloud credentials for both boto3 and s5cmd.

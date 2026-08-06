@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import tempfile
 import time
@@ -13,7 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import GatewayConfig, MediaPolicy
-from .errors import ConditionalWriteFailed, IntegrityError, InvalidRequestError, RelayError
+from .errors import (
+    ConditionalWriteFailed,
+    IntegrityError,
+    InvalidRequestError,
+    ObjectNotFoundError,
+    RelayError,
+)
 from .layout import ObjectLayout
 from .media import MediaMaterializer
 from .protocol import (
@@ -76,6 +84,8 @@ class RelayClient:
         media_policy: MediaPolicy | None = None,
         poll_interval_seconds: float = 0.5,
         upload_concurrency: int = 8,
+        compact_protocol: bool = False,
+        compact_manifest_max_bytes: int = 1024**2,
     ) -> None:
         self.store = store
         self.layout = ObjectLayout(prefix)
@@ -83,6 +93,8 @@ class RelayClient:
         self.media_policy = media_policy or MediaPolicy()
         self.poll_interval_seconds = poll_interval_seconds
         self.upload_concurrency = max(1, upload_concurrency)
+        self.compact_protocol = compact_protocol
+        self.compact_manifest_max_bytes = max(0, compact_manifest_max_bytes)
 
     def _job_id(self, target: str, idempotency_key: str | None) -> tuple[str, str | None]:
         if idempotency_key is None:
@@ -100,10 +112,33 @@ class RelayClient:
         return value
 
     def _load_request(self, target: str, job_id: str) -> RelayRequest | None:
-        key = self.layout.manifest(target, job_id)
-        if self.store.head(key) is None:
+        try:
+            ready_data = self.store.get_bytes(
+                self.layout.ready(target, job_id), max_bytes=24 * 1024**2
+            )
+        except ObjectNotFoundError:
+            ready = None
+        else:
+            ready = ReadyMarker.model_validate_json(ready_data)
+        if ready is not None and ready.manifest_base64 is not None:
+            manifest_data = self._decode_base64(ready.manifest_base64, "request manifest")
+            if sha256_bytes(manifest_data) != ready.manifest_sha256:
+                raise IntegrityError(f"manifest digest mismatch for {job_id}")
+            return RelayRequest.model_validate_json(manifest_data)
+        try:
+            manifest_data = self.store.get_bytes(
+                self.layout.manifest(target, job_id), max_bytes=16 * 1024**2
+            )
+        except ObjectNotFoundError:
             return None
-        return RelayRequest.model_validate_json(self.store.get_bytes(key, max_bytes=16 * 1024**2))
+        return RelayRequest.model_validate_json(manifest_data)
+
+    @staticmethod
+    def _decode_base64(value: str, description: str) -> bytes:
+        try:
+            return base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise IntegrityError(f"invalid base64 {description}") from exc
 
     def submit(
         self,
@@ -159,7 +194,11 @@ class RelayClient:
 
             manifest_data = canonical_json_bytes(request.model_dump(mode="json"))
             manifest_key = self.layout.manifest(target, job_id)
-            if existing is None:
+            inline_manifest = (
+                self.compact_protocol
+                and len(manifest_data) <= self.compact_manifest_max_bytes
+            )
+            if existing is None and not inline_manifest:
                 try:
                     self.store.put_bytes(
                         manifest_key,
@@ -182,22 +221,36 @@ class RelayClient:
                 job_id=request.job_id,
                 target=request.target,
                 manifest_sha256=sha256_bytes(manifest_data),
+                manifest_base64=(
+                    base64.b64encode(manifest_data).decode("ascii") if inline_manifest else None
+                ),
+                compact_response=self.compact_protocol,
             )
             try:
                 self.store.put_bytes(
                     self.layout.ready(target, job_id),
-                    canonical_json_bytes(ready.model_dump(mode="json")),
+                    canonical_json_bytes(ready.model_dump(mode="json", exclude_defaults=True)),
                     content_type="application/json",
                     if_absent=True,
                 )
             except ConditionalWriteFailed as exc:
                 current = ReadyMarker.model_validate_json(
-                    self.store.get_bytes(self.layout.ready(target, job_id), max_bytes=64 * 1024)
+                    self.store.get_bytes(
+                        self.layout.ready(target, job_id), max_bytes=24 * 1024**2
+                    )
                 )
                 if current.manifest_sha256 != ready.manifest_sha256:
-                    raise IntegrityError(
-                        "READY marker does not match the request manifest"
-                    ) from exc
+                    winner = self._load_request(target, job_id)
+                    if (
+                        winner is None
+                        or idempotency_key is None
+                        or self._equivalence_payload(winner)
+                        != self._equivalence_payload(request)
+                    ):
+                        raise IntegrityError(
+                            "READY marker does not match the request manifest"
+                        ) from exc
+                    request = winner
             return JobHandle(
                 job_id=request.job_id,
                 target=request.target,
@@ -208,22 +261,48 @@ class RelayClient:
 
     def status(self, job_id: str) -> JobStatusView:
         key = self.layout.done(job_id)
-        if self.store.head(key) is None:
+        try:
+            raw = self.store.get_bytes(key, max_bytes=24 * 1024**2)
+        except ObjectNotFoundError:
             return JobStatusView(job_id=job_id, state="PENDING")
-        done = DoneMarker.model_validate_json(self.store.get_bytes(key, max_bytes=64 * 1024))
+        done = DoneMarker.model_validate_json(raw)
         return JobStatusView(job_id=job_id, state=done.status.value, done=done)
 
-    def _read_completed(self, job_id: str, directory: Path) -> CompletedJob:
-        done_data = self.store.get_bytes(self.layout.done(job_id), max_bytes=64 * 1024)
+    def _read_completed(
+        self, job_id: str, directory: Path, *, done_data: bytes | None = None
+    ) -> CompletedJob:
+        if done_data is None:
+            done_data = self.store.get_bytes(
+                self.layout.done(job_id), max_bytes=24 * 1024**2
+            )
         done = DoneMarker.model_validate_json(done_data)
+        if done.response is not None:
+            metadata = done.response
+            metadata_data = canonical_json_bytes(metadata.model_dump(mode="json"))
+            if sha256_bytes(metadata_data) != done.response_sha256:
+                raise IntegrityError(f"response metadata digest mismatch for {job_id}")
+            if metadata.body_base64 is None:
+                raise IntegrityError(f"compact response has no inline body for {job_id}")
+            body = self._decode_base64(metadata.body_base64, "response body")
+            if len(body) != metadata.body_size_bytes:
+                raise IntegrityError(f"response body size mismatch for {job_id}")
+            if sha256_bytes(body) != metadata.body_sha256:
+                raise IntegrityError(f"response body digest mismatch for {job_id}")
+            return CompletedJob(metadata=metadata, body=body)
         metadata_data = self.store.get_bytes(
             self.layout.response_metadata(job_id), max_bytes=4 * 1024**2
         )
         if sha256_bytes(metadata_data) != done.response_sha256:
             raise IntegrityError(f"response metadata digest mismatch for {job_id}")
         metadata = RelayResponse.model_validate_json(metadata_data)
+        if metadata.body_object is None:
+            raise IntegrityError(f"response body object is missing for {job_id}")
         body_path = directory / "response.body"
-        self.store.download_file(metadata.body_object, body_path)
+        self.store.download_file(
+            metadata.body_object,
+            body_path,
+            expected_size_bytes=metadata.body_size_bytes,
+        )
         if body_path.stat().st_size != metadata.body_size_bytes:
             raise IntegrityError(f"response body size mismatch for {job_id}")
         if sha256_file(body_path) != metadata.body_sha256:
@@ -237,6 +316,7 @@ class RelayClient:
         timeout_seconds: float | None = None,
         cleanup: bool = False,
         raise_on_failure: bool = False,
+        acknowledge: bool = True,
     ) -> CompletedJob:
         job_id = handle.job_id if isinstance(handle, JobHandle) else handle
         target = handle.target if isinstance(handle, JobHandle) else None
@@ -247,15 +327,22 @@ class RelayClient:
             if isinstance(handle, JobHandle)
             else 900.0
         )
-        while self.store.head(self.layout.done(job_id)) is None:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for relay job {job_id}")
-            time.sleep(self.poll_interval_seconds)
+        while True:
+            try:
+                done_data = self.store.get_bytes(
+                    self.layout.done(job_id), max_bytes=24 * 1024**2
+                )
+                break
+            except ObjectNotFoundError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for relay job {job_id}") from None
+                time.sleep(self.poll_interval_seconds)
         with tempfile.TemporaryDirectory(prefix=f"gb300-relay-result-{job_id}-") as directory:
-            completed = self._read_completed(job_id, Path(directory))
+            completed = self._read_completed(job_id, Path(directory), done_data=done_data)
         if target is None:
             target = completed.metadata.target
-        self.acknowledge(job_id)
+        if acknowledge:
+            self.acknowledge(job_id)
         if cleanup:
             self.cleanup(target=target, job_id=job_id)
         if raise_on_failure and completed.metadata.status != JobStatus.SUCCEEDED:
@@ -282,8 +369,13 @@ class RelayClient:
         while True:
             if done is None:
                 done_key = self.layout.done(handle.job_id)
-                if await asyncio.to_thread(self.store.head, done_key) is not None:
-                    raw = await asyncio.to_thread(self.store.get_bytes, done_key)
+                try:
+                    raw = await asyncio.to_thread(
+                        self.store.get_bytes, done_key, max_bytes=24 * 1024**2
+                    )
+                except ObjectNotFoundError:
+                    pass
+                else:
                     done = DoneMarker.model_validate_json(raw)
             objects = await asyncio.to_thread(
                 self.store.list, self.layout.stream_prefix(handle.job_id)
@@ -355,9 +447,11 @@ class RelayClient:
             return
 
     def cleanup(self, *, target: str, job_id: str) -> int:
-        removed = 0
-        for prefix in self.layout.job_cleanup_prefixes(target, job_id):
-            removed += self.store.delete_prefix(prefix)
+        prefixes = self.layout.job_cleanup_prefixes(target, job_id)
+        with ThreadPoolExecutor(max_workers=len(prefixes)) as executor:
+            groups = list(executor.map(self.store.list, prefixes))
+        keys = [item.key for group in groups for item in group]
+        self.store.delete_keys(keys)
         self.store.delete_keys(
             (
                 self.layout.ack(job_id),
@@ -365,7 +459,7 @@ class RelayClient:
                 self.layout.deadletter(target, job_id),
             )
         )
-        return removed
+        return len(keys)
 
 
 def client_from_gateway_config(
@@ -377,4 +471,6 @@ def client_from_gateway_config(
         client_id=config.client_id,
         media_policy=config.media,
         poll_interval_seconds=config.poll_interval_seconds,
+        compact_protocol=config.compact_protocol,
+        compact_manifest_max_bytes=config.compact_manifest_max_bytes,
     )

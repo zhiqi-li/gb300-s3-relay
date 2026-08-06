@@ -9,7 +9,35 @@ from gb300_relay.lease import LeaseManager
 from gb300_relay.storage import MemoryObjectStore
 
 
+class CountingStore(MemoryObjectStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gets = 0
+        self.lists = 0
+
+    def get_bytes(self, key, *, max_bytes=None):
+        self.gets += 1
+        return super().get_bytes(key, max_bytes=max_bytes)
+
+    def list(self, prefix):
+        self.lists += 1
+        return super().list(prefix)
+
+
 class LeaseTests(unittest.TestCase):
+    def test_owner_fencing_uses_one_listing_for_an_acquired_immutable_claim(self) -> None:
+        store = CountingStore()
+        leases = LeaseManager(store, ObjectLayout("relay/v1"), clock_skew_grace_seconds=0)
+        token = leases.acquire(
+            target="gb300-1", job_id="job-1", worker_id="worker-1", lease_seconds=30
+        )
+        assert token is not None
+        store.gets = 0
+        store.lists = 0
+        leases.assert_owner(token)
+        self.assertEqual(store.lists, 1)
+        self.assertEqual(store.gets, 0)
+
     def test_only_one_worker_wins_a_generation(self) -> None:
         store = MemoryObjectStore()
         leases = LeaseManager(store, ObjectLayout("relay/v1"), clock_skew_grace_seconds=0)

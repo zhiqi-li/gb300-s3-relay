@@ -20,6 +20,26 @@ client-side gateway <-- result/SSE chunks -- S3 <-- local HTTP -- model server
 
 The client and GB300 hosts do not need network routes to one another. Both sides only need access to the same S3-compatible endpoint.
 
+## Performance modes
+
+The gateway template enables the compact protocol. After assets are uploaded, requests whose
+manifest is at most `compact_manifest_max_bytes` commit as one self-contained `READY.json`.
+Responses up to the worker's `compact_response_max_bytes` commit as one self-contained
+`DONE.json`. Larger payloads transparently retain the full manifest/body/metadata sequence and
+use s5cmd where appropriate. This removes process startup and several object-store round trips
+from the latency-sensitive text and small-JSON path without reducing large-media capacity.
+
+Files no larger than `native_transfer_max_bytes` use the persistent boto3 connection; larger
+files use s5cmd. The storage doctor explicitly forces one s5cmd round trip, so its
+`s5cmd_round_trip=ok` result continues to validate both data paths.
+
+Worker admission has two limits. `max_concurrency` controls all in-flight jobs, while
+`max_heavy_concurrency` separately bounds requests that contain assets or whose serialized body
+exceeds `heavy_request_threshold_bytes`. This permits high short-text concurrency without
+allowing a burst of long-context or multimodal requests to exhaust KV cache.
+`thread_pool_workers` sizes the blocking object-store I/O executor independently of model
+admission; keep it at least as large as `max_concurrency` for bursty workloads.
+
 ## Quick start
 
 Install the same repository on the client/OSMO side and on each GB300 host:
@@ -146,7 +166,7 @@ For large videos, enable `file://` inputs only for explicit roots using `allow_f
 
 ## Lifecycle and delivery guarantees
 
-Submission order is assets, `manifest.json`, then `READY.json`. Completion order is response body or stream chunks, `response.json`, then `DONE.json`. Contended writes use `If-None-Match: *`, and requests, assets, and responses carry size and SHA-256 metadata.
+In the standard path, submission order is assets, `manifest.json`, then `READY.json`, and completion order is response body or stream chunks, `response.json`, then `DONE.json`. In the compact path, the manifest is embedded in `READY.json` and a small response is embedded in `DONE.json`; those immutable objects remain the respective commit points. Contended writes use `If-None-Match: *`, and requests, assets, and responses carry size and SHA-256 metadata.
 
 - During a live lease, only one worker calls the model for a job.
 - A new immutable lease generation can take over after worker failure. Execution across lease expiry is therefore **at least once**, not exactly once. Use stable idempotency keys for costly calls and avoid non-idempotent upstream side effects.

@@ -30,6 +30,7 @@ class S3Config(ConfigModel):
     operation_timeout_seconds: float = Field(default=300.0, gt=0, le=86_400)
     retry_count: int = Field(default=10, ge=0, le=100)
     max_pool_connections: int = Field(default=128, ge=1, le=4_096)
+    native_transfer_max_bytes: int = Field(default=8 * 1024**2, ge=0, le=1024**3)
 
     @field_validator("prefix")
     @classmethod
@@ -76,6 +77,9 @@ class GatewayConfig(ConfigModel):
     require_healthy_worker: bool = True
     cleanup_on_success: bool = True
     cleanup_idempotent_on_success: bool = False
+    compact_protocol: bool = False
+    compact_manifest_max_bytes: int = Field(default=1024**2, ge=0, le=16 * 1024**2)
+    thread_pool_workers: int = Field(default=128, ge=4, le=1_024)
     max_json_body_bytes: int = Field(default=1024**3, ge=1, le=16 * 1024**3)
     auth_token_env: str | None = None
     client_id: str = Field(default_factory=lambda: f"gateway-{socket.gethostname()}-{os.getpid()}")
@@ -102,6 +106,9 @@ class WorkerConfig(ConfigModel):
     upstream_base_url: str = "http://127.0.0.1:8000"
     upstream_api_key_env: str | None = "GB300_UPSTREAM_API_KEY"
     max_concurrency: int = Field(default=8, ge=1, le=1_024)
+    max_heavy_concurrency: int = Field(default=8, ge=1, le=1_024)
+    heavy_request_threshold_bytes: int = Field(default=128 * 1024, ge=1, le=1024**3)
+    thread_pool_workers: int = Field(default=128, ge=4, le=1_024)
     asset_transfer_concurrency: int = Field(default=8, ge=1, le=128)
     poll_interval_seconds: float = Field(default=0.5, gt=0, le=60)
     poll_jitter_seconds: float = Field(default=0.25, ge=0, le=60)
@@ -115,6 +122,7 @@ class WorkerConfig(ConfigModel):
     media_delivery: Literal["auto", "data_uri", "file_uri"] = "auto"
     inline_image_max_bytes: int = Field(default=32 * 1024**2, ge=1)
     max_response_bytes: int = Field(default=512 * 1024**2, ge=1)
+    compact_response_max_bytes: int = Field(default=1024**2, ge=0, le=16 * 1024**2)
     stream_chunk_bytes: int = Field(default=256 * 1024, ge=1_024, le=64 * 1024**2)
     stream_flush_interval_seconds: float = Field(default=0.5, gt=0, le=60)
     shutdown_grace_seconds: float = Field(default=300.0, ge=0, le=7_200)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gb300-s3-relay"
-version = "0.1.0"
+version = "0.2.0"
 description = "S3-backed OpenAI-compatible relay between OSMO workloads and GB300 model servers"
 readme = "README.md"
 requires-python = ">=3.11"

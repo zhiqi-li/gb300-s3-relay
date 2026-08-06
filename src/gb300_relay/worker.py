@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
 import random
 import tempfile
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -86,6 +88,9 @@ class RelayWorker:
         self.upstream = upstream or OpenAIUpstream(config)
         self.metrics = metrics or RelayMetrics("worker")
         self.leases = LeaseManager(store, self.layout)
+        self._heavy_slots = asyncio.Semaphore(
+            min(config.max_heavy_concurrency, config.max_concurrency)
+        )
         self._inflight: dict[str, asyncio.Task[ProcessOutcome]] = {}
         self._stop = asyncio.Event()
 
@@ -142,7 +147,9 @@ class RelayWorker:
                             break
                         if job_id in self._inflight:
                             continue
-                        task = asyncio.create_task(self.process(job_id), name=f"job:{job_id}")
+                        task = asyncio.create_task(
+                            self.process(job_id, discovered=True), name=f"job:{job_id}"
+                        )
                         self._inflight[job_id] = task
                         available -= 1
                 self.metrics.inflight.labels("worker", self.config.target).set(len(self._inflight))
@@ -177,7 +184,11 @@ class RelayWorker:
                 return outcomes
             for offset in range(0, len(jobs), self.config.max_concurrency):
                 batch = jobs[offset : offset + self.config.max_concurrency]
-                outcomes.extend(await asyncio.gather(*(self.process(job) for job in batch)))
+                outcomes.extend(
+                    await asyncio.gather(
+                        *(self.process(job, discovered=True) for job in batch)
+                    )
+                )
 
     def _reap_tasks(self) -> None:
         for job_id, task in list(self._inflight.items()):
@@ -251,18 +262,24 @@ class RelayWorker:
 
     async def _download_request(
         self, job_id: str, directory: Path
-    ) -> tuple[RelayRequest, dict[str, Path]]:
+    ) -> tuple[ReadyMarker, RelayRequest, dict[str, Path]]:
         ready_data = await asyncio.to_thread(
             self.store.get_bytes,
             self.layout.ready(self.config.target, job_id),
-            max_bytes=64 * 1024,
+            max_bytes=24 * 1024**2,
         )
         ready = ReadyMarker.model_validate_json(ready_data)
-        manifest_data = await asyncio.to_thread(
-            self.store.get_bytes,
-            self.layout.manifest(self.config.target, job_id),
-            max_bytes=16 * 1024**2,
-        )
+        if ready.manifest_base64 is not None:
+            try:
+                manifest_data = base64.b64decode(ready.manifest_base64, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise IntegrityError(f"invalid base64 manifest for {job_id}") from exc
+        else:
+            manifest_data = await asyncio.to_thread(
+                self.store.get_bytes,
+                self.layout.manifest(self.config.target, job_id),
+                max_bytes=16 * 1024**2,
+            )
         if sha256_bytes(manifest_data) != ready.manifest_sha256:
             raise IntegrityError(f"manifest digest mismatch for {job_id}")
         request = RelayRequest.model_validate_json(manifest_data)
@@ -282,6 +299,7 @@ class RelayWorker:
                     self.store.download_file,
                     self.layout.asset(self.config.target, request.job_id, descriptor.object_name),
                     path,
+                    expected_size_bytes=descriptor.size_bytes,
                 )
             if path.stat().st_size != descriptor.size_bytes:
                 raise IntegrityError(f"asset size mismatch: {descriptor.asset_id}")
@@ -291,12 +309,14 @@ class RelayWorker:
             asset_paths[descriptor.asset_id] = path
 
         await asyncio.gather(*(download(descriptor) for descriptor in request.assets))
-        return request, asset_paths
+        return ready, request, asset_paths
 
-    async def process(self, job_id: str) -> ProcessOutcome:
+    async def process(self, job_id: str, *, discovered: bool = False) -> ProcessOutcome:
+        # LIST results can briefly outlive a concurrently deleted READY marker.
+        # Always confirm the commit marker before creating a lease generation.
         if not await asyncio.to_thread(self._is_ready, job_id):
             return ProcessOutcome(job_id, handled=False)
-        if await asyncio.to_thread(self._is_done, job_id):
+        if not discovered and await asyncio.to_thread(self._is_done, job_id):
             return ProcessOutcome(job_id, handled=False)
         token = await asyncio.to_thread(
             self.leases.acquire,
@@ -312,8 +332,12 @@ class RelayWorker:
         # before this coroutine acquires its claim. Recheck both markers so a stale
         # READY listing cannot resurrect an already delivered request.
         if not await asyncio.to_thread(self._is_ready, job_id):
-            return ProcessOutcome(job_id, handled=False)
-        if await asyncio.to_thread(self._is_done, job_id):
+            await asyncio.to_thread(
+                self.store.delete_prefix,
+                self.layout.claim_generation_prefix(
+                    token.target, token.job_id, token.generation
+                ),
+            )
             return ProcessOutcome(job_id, handled=False)
         started = time.monotonic()
         lost = asyncio.Event()
@@ -326,7 +350,7 @@ class RelayWorker:
                 prefix=f"{job_id}-", dir=self.config.work_dir
             ) as raw_directory:
                 directory = Path(raw_directory)
-                request, assets = await self._download_request(job_id, directory)
+                ready, request, assets = await self._download_request(job_id, directory)
                 endpoint = request.endpoint
                 if request.expires_at <= datetime.now(UTC):
                     status = await self._publish_error(
@@ -338,9 +362,10 @@ class RelayWorker:
                         http_status=408,
                         job_status=JobStatus.EXPIRED,
                         attempt=1,
+                        compact_response=ready.compact_response,
                     )
                     return ProcessOutcome(job_id, handled=True, status=status)
-                if await asyncio.to_thread(self._is_cancelled, job_id):
+                if request.stream and await asyncio.to_thread(self._is_cancelled, job_id):
                     status = await self._publish_error(
                         request,
                         token,
@@ -350,19 +375,39 @@ class RelayWorker:
                         http_status=499,
                         job_status=JobStatus.CANCELLED,
                         attempt=1,
+                        compact_response=ready.compact_response,
                     )
                     return ProcessOutcome(job_id, handled=True, status=status)
-                body = restore_asset_references(
-                    request.body,
-                    request.assets,
-                    assets,
-                    delivery=self.config.media_delivery,
-                    inline_image_max_bytes=self.config.inline_image_max_bytes,
-                )
-                if request.stream:
-                    status = await self._process_stream(request, body, token, directory, lost)
-                else:
-                    status = await self._process_regular(request, body, token, directory, lost)
+                is_heavy = bool(request.assets) or len(
+                    canonical_json_bytes(request.body)
+                ) >= self.config.heavy_request_threshold_bytes
+                limiter = self._heavy_slots if is_heavy else nullcontext()
+                async with limiter:
+                    body = restore_asset_references(
+                        request.body,
+                        request.assets,
+                        assets,
+                        delivery=self.config.media_delivery,
+                        inline_image_max_bytes=self.config.inline_image_max_bytes,
+                    )
+                    if request.stream:
+                        status = await self._process_stream(
+                            request,
+                            body,
+                            token,
+                            directory,
+                            lost,
+                            compact_response=ready.compact_response,
+                        )
+                    else:
+                        status = await self._process_regular(
+                            request,
+                            body,
+                            token,
+                            directory,
+                            lost,
+                            compact_response=ready.compact_response,
+                        )
                 return ProcessOutcome(job_id, handled=True, status=status)
         except (IntegrityError, InvalidRequestError, ObjectNotFoundError, ValidationError) as exc:
             request = locals().get("request")
@@ -388,6 +433,10 @@ class RelayWorker:
                     message=str(exc),
                     http_status=400,
                     attempt=1,
+                    compact_response=bool(
+                        isinstance(locals().get("ready"), ReadyMarker)
+                        and locals()["ready"].compact_response
+                    ),
                 )
                 return ProcessOutcome(job_id, handled=True, status=status)
         finally:
@@ -414,6 +463,8 @@ class RelayWorker:
         token: LeaseToken,
         directory: Path,
         lost: asyncio.Event,
+        *,
+        compact_response: bool,
     ) -> JobStatus:
         last_error: UpstreamError | None = None
         for attempt in range(1, self.config.max_attempts + 1):
@@ -429,6 +480,7 @@ class RelayWorker:
                     http_status=499,
                     job_status=JobStatus.CANCELLED,
                     attempt=attempt,
+                    compact_response=compact_response,
                 )
             try:
                 async with asyncio.timeout(self.config.job_timeout_seconds):
@@ -446,6 +498,7 @@ class RelayWorker:
                         headers=response.headers,
                         status=JobStatus.SUCCEEDED,
                         attempt=attempt,
+                        compact_response=compact_response,
                     )
                     return JobStatus.SUCCEEDED
                 error = UpstreamError(
@@ -472,6 +525,7 @@ class RelayWorker:
                             retryable=error.retryable,
                             attempt=attempt,
                         ),
+                        compact_response=compact_response,
                     )
                     return JobStatus.FAILED
                 last_error = error
@@ -494,6 +548,7 @@ class RelayWorker:
             retryable=last_error.retryable,
             attempt=self.config.max_attempts,
             body=last_error.response_body,
+            compact_response=compact_response,
         )
 
     async def _process_stream(
@@ -503,6 +558,8 @@ class RelayWorker:
         token: LeaseToken,
         directory: Path,
         lost: asyncio.Event,
+        *,
+        compact_response: bool,
     ) -> JobStatus:
         body = dict(body)
         body["stream"] = True
@@ -573,6 +630,7 @@ class RelayWorker:
                 status=JobStatus.SUCCEEDED,
                 attempt=1,
                 stream_chunk_count=sequence,
+                compact_response=compact_response,
             )
             return JobStatus.SUCCEEDED
         except (TimeoutError, UpstreamError) as exc:
@@ -600,6 +658,7 @@ class RelayWorker:
                     retryable=getattr(exc, "retryable", False),
                     attempt=1,
                 ),
+                compact_response=compact_response,
             )
             return JobStatus.FAILED
 
@@ -631,6 +690,7 @@ class RelayWorker:
         retryable: bool = False,
         job_status: JobStatus = JobStatus.FAILED,
         body: bytes | None = None,
+        compact_response: bool = False,
     ) -> JobStatus:
         failure = RelayFailure(
             type=error_type,
@@ -658,6 +718,7 @@ class RelayWorker:
             status=job_status,
             attempt=attempt,
             failure=failure,
+            compact_response=compact_response,
         )
         return job_status
 
@@ -674,6 +735,7 @@ class RelayWorker:
         status: JobStatus,
         attempt: int,
         failure: RelayFailure | None = None,
+        compact_response: bool = False,
     ) -> None:
         response_path = directory / "response.body"
         response_path.write_bytes(body)
@@ -687,6 +749,7 @@ class RelayWorker:
             status=status,
             attempt=attempt,
             failure=failure,
+            compact_response=compact_response,
         )
 
     async def _publish_response_file(
@@ -702,14 +765,24 @@ class RelayWorker:
         attempt: int,
         stream_chunk_count: int | None = None,
         failure: RelayFailure | None = None,
+        compact_response: bool = False,
     ) -> None:
-        await asyncio.to_thread(self.leases.assert_owner, token)
-        body_key = self.layout.response_body(request.job_id, token.generation)
-        await asyncio.to_thread(self.store.upload_file, response_path, body_key)
+        body_size = response_path.stat().st_size
         body_digest = await asyncio.to_thread(sha256_file, response_path)
-        # Uploads can take minutes for large video responses. Recheck the fencing
-        # generation immediately before publishing the immutable terminal metadata.
+        use_compact = (
+            compact_response and body_size <= self.config.compact_response_max_bytes
+        )
+        body_key: str | None = None
+        body_base64: str | None = None
         await asyncio.to_thread(self.leases.assert_owner, token)
+        if use_compact:
+            body_base64 = base64.b64encode(response_path.read_bytes()).decode("ascii")
+        else:
+            body_key = self.layout.response_body(request.job_id, token.generation)
+            await asyncio.to_thread(self.store.upload_file, response_path, body_key)
+            # Uploads can take minutes for large responses. Recheck fencing after
+            # the transfer before publishing immutable terminal metadata.
+            await asyncio.to_thread(self.leases.assert_owner, token)
         metadata = RelayResponse(
             job_id=request.job_id,
             target=request.target,
@@ -720,37 +793,42 @@ class RelayWorker:
             http_status=http_status,
             content_type=content_type,
             body_object=body_key,
+            body_base64=body_base64,
             body_sha256=body_digest,
-            body_size_bytes=response_path.stat().st_size,
+            body_size_bytes=body_size,
             response_headers=headers,
             failure=failure,
             stream_chunk_count=stream_chunk_count,
         )
         metadata_data = canonical_json_bytes(metadata.model_dump(mode="json"))
-        metadata_key = self.layout.response_metadata(request.job_id)
-        try:
-            await asyncio.to_thread(
-                self.store.put_bytes,
-                metadata_key,
-                metadata_data,
-                content_type="application/json",
-                if_absent=True,
-            )
-        except ConditionalWriteFailed as exc:
-            existing = await asyncio.to_thread(self.store.get_bytes, metadata_key)
-            if existing != metadata_data:
-                raise IntegrityError(f"response metadata collision for {request.job_id}") from exc
+        if not use_compact:
+            metadata_key = self.layout.response_metadata(request.job_id)
+            try:
+                await asyncio.to_thread(
+                    self.store.put_bytes,
+                    metadata_key,
+                    metadata_data,
+                    content_type="application/json",
+                    if_absent=True,
+                )
+            except ConditionalWriteFailed as exc:
+                existing = await asyncio.to_thread(self.store.get_bytes, metadata_key)
+                if existing != metadata_data:
+                    raise IntegrityError(
+                        f"response metadata collision for {request.job_id}"
+                    ) from exc
         done = DoneMarker(
             job_id=request.job_id,
             status=status,
             response_sha256=sha256_bytes(metadata_data),
+            response=metadata if use_compact else None,
             stream_chunk_count=stream_chunk_count,
         )
         try:
             await asyncio.to_thread(
                 self.store.put_bytes,
                 self.layout.done(request.job_id),
-                canonical_json_bytes(done.model_dump(mode="json")),
+                canonical_json_bytes(done.model_dump(mode="json", exclude_none=True)),
                 content_type="application/json",
                 if_absent=True,
             )

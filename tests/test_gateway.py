@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,7 +13,9 @@ import httpx
 
 from gb300_relay.client import RelayClient
 from gb300_relay.config import GatewayConfig, MediaPolicy, WorkerConfig
-from gb300_relay.gateway import create_app
+from gb300_relay.gateway import TargetSelector, create_app
+from gb300_relay.layout import ObjectLayout
+from gb300_relay.protocol import WorkerHeartbeat, canonical_json_bytes
 from gb300_relay.storage import MemoryObjectStore
 from gb300_relay.upstream import UpstreamResponse, UpstreamStream
 from gb300_relay.worker import RelayWorker
@@ -56,6 +60,22 @@ class EchoUpstream:
 
     async def close(self):
         return None
+
+
+class BlockingRefreshStore(MemoryObjectStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.worker_lists = 0
+        self.refresh_entered = threading.Event()
+        self.release_refresh = threading.Event()
+
+    def list(self, prefix):
+        if prefix.endswith("/workers/"):
+            self.worker_lists += 1
+            if self.worker_lists > 1:
+                self.refresh_entered.set()
+                self.release_refresh.wait(timeout=2)
+        return super().list(prefix)
 
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
@@ -172,6 +192,31 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             response = await http.post("/v1/chat/completions", json=["not", "an", "object"])
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+
+    async def test_stale_worker_cache_refresh_does_not_block_selection(self) -> None:
+        store = BlockingRefreshStore()
+        layout = ObjectLayout("relay/v1")
+        heartbeat = WorkerHeartbeat(
+            target="gb300-1", worker_id="worker-1", max_concurrency=64, inflight=0
+        )
+        store.put_bytes(
+            layout.worker_heartbeat("gb300-1", "worker-1"),
+            canonical_json_bytes(heartbeat.model_dump(mode="json")),
+        )
+        selector = TargetSelector(
+            store,
+            layout,
+            GatewayConfig(targets=("gb300-1",)),
+            cache_seconds=0,
+        )
+        self.assertEqual(selector.select(), "gb300-1")
+        started = time.monotonic()
+        try:
+            self.assertEqual(selector.select(), "gb300-1")
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertTrue(store.refresh_entered.wait(timeout=1))
+        finally:
+            store.release_refresh.set()
 
 
 if __name__ == "__main__":

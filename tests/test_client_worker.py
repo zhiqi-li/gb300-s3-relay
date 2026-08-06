@@ -266,6 +266,33 @@ class ClientWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(item.handled for item in outcomes), 1)
         self.assertEqual(first_upstream.calls + second_upstream.calls, 1)
 
+    async def test_stale_ready_discovery_does_not_leave_an_orphan_claim(self) -> None:
+        store = MemoryObjectStore()
+        relay = client(store)
+        handle = relay.submit(
+            endpoint="/v1/chat/completions",
+            body={"model": "m", "messages": []},
+            target="gb300-1",
+            timeout_seconds=30,
+        )
+        store.delete_prefix(f"relay/v1/requests/gb300-1/{handle.job_id}/")
+        with tempfile.TemporaryDirectory() as directory:
+            worker = RelayWorker(
+                store,
+                prefix="relay/v1",
+                config=WorkerConfig(
+                    target="gb300-1",
+                    worker_id="worker-1",
+                    work_dir=Path(directory),
+                    lease_seconds=30,
+                    lease_heartbeat_seconds=5,
+                ),
+                upstream=FakeUpstream(),
+            )
+            outcome = await worker.process(handle.job_id, discovered=True)
+        self.assertFalse(outcome.handled)
+        self.assertFalse(store.list(f"relay/v1/claims/gb300-1/{handle.job_id}/"))
+
     async def test_retries_retryable_upstream_status(self) -> None:
         store = MemoryObjectStore()
         relay = client(store)

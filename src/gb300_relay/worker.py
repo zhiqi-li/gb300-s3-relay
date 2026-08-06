@@ -312,11 +312,12 @@ class RelayWorker:
         return ready, request, asset_paths
 
     async def process(self, job_id: str, *, discovered: bool = False) -> ProcessOutcome:
-        if not discovered:
-            if not await asyncio.to_thread(self._is_ready, job_id):
-                return ProcessOutcome(job_id, handled=False)
-            if await asyncio.to_thread(self._is_done, job_id):
-                return ProcessOutcome(job_id, handled=False)
+        # LIST results can briefly outlive a concurrently deleted READY marker.
+        # Always confirm the commit marker before creating a lease generation.
+        if not await asyncio.to_thread(self._is_ready, job_id):
+            return ProcessOutcome(job_id, handled=False)
+        if not discovered and await asyncio.to_thread(self._is_done, job_id):
+            return ProcessOutcome(job_id, handled=False)
         token = await asyncio.to_thread(
             self.leases.acquire,
             target=self.config.target,
@@ -331,8 +332,20 @@ class RelayWorker:
         # before this coroutine acquires its claim. Recheck both markers so a stale
         # READY listing cannot resurrect an already delivered request.
         if not await asyncio.to_thread(self._is_ready, job_id):
+            await asyncio.to_thread(
+                self.store.delete_prefix,
+                self.layout.claim_generation_prefix(
+                    token.target, token.job_id, token.generation
+                ),
+            )
             return ProcessOutcome(job_id, handled=False)
         if await asyncio.to_thread(self._is_done, job_id):
+            await asyncio.to_thread(
+                self.store.delete_prefix,
+                self.layout.claim_generation_prefix(
+                    token.target, token.job_id, token.generation
+                ),
+            )
             return ProcessOutcome(job_id, handled=False)
         started = time.monotonic()
         lost = asyncio.Event()

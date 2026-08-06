@@ -36,11 +36,12 @@ Never put credential values into TOML, command arguments, source control, logs, 
    - `s5cmd_round_trip=ok`
    - a nonzero cleanup count for the probe objects
 5. Start every worker.
-6. Wait for `/readyz` on the gateway to report at least one healthy worker for each required target.
-7. Start or expose the gateway only on the intended interface. Configure `auth_token_env` before any non-loopback bind.
-8. Set `OPENAI_BASE_URL=http://<gateway>/v1` and a nonempty `OPENAI_API_KEY` in the application.
-9. Perform one forced-target request per worker, one load-balanced request, and one streaming request.
-10. If multimodal inference is required, test an actual image and video accepted by the deployed model, not only transport fixtures.
+6. Enable `gateway.compact_protocol` only after every target runs the matching worker version.
+7. Wait for `/readyz` on the gateway to report at least one healthy worker for each required target.
+8. Start or expose the gateway only on the intended interface. Configure `auth_token_env` before any non-loopback bind.
+9. Set `OPENAI_BASE_URL=http://<gateway>/v1` and a nonempty `OPENAI_API_KEY` in the application.
+10. Perform one forced-target request per worker, one load-balanced request, and one streaming request.
+11. If multimodal inference is required, test an actual image and video accepted by the deployed model, not only transport fixtures.
 
 ## Readiness gates
 

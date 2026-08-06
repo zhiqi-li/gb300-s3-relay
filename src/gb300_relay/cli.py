@@ -87,6 +87,8 @@ def _client(config: AppConfig, store: S3ObjectStore) -> RelayClient:
         client_id=gateway.client_id,
         media_policy=gateway.media,
         poll_interval_seconds=gateway.poll_interval_seconds,
+        compact_protocol=gateway.compact_protocol,
+        compact_manifest_max_bytes=gateway.compact_manifest_max_bytes,
     )
 
 
@@ -183,8 +185,8 @@ def _doctor(config: AppConfig, *, skip_transfer: bool) -> int:
                 destination = Path(directory) / "destination.bin"
                 source.write_bytes(os.urandom(1024 * 1024 + 17))
                 data_key = f"{probe}/transfer.bin"
-                store.upload_file(source, data_key)
-                store.download_file(data_key, destination)
+                store.upload_file(source, data_key, force_s5cmd=True)
+                store.download_file(data_key, destination, force_s5cmd=True)
                 if sha256_file(source) != sha256_file(destination):
                     raise RelayError("s5cmd round-trip digest mismatch")
                 print("s5cmd_round_trip=ok")
@@ -227,12 +229,15 @@ def _wait(config: AppConfig, args: argparse.Namespace) -> int:
 def _status(config: AppConfig, args: argparse.Namespace) -> int:
     with S3ObjectStore(config.s3) as store:
         status = _client(config, store).status(args.job_id)
+    done = status.done.model_dump(mode="json") if status.done else None
+    if done and done.get("response"):
+        done["response"]["body_base64"] = "<omitted>"
     print(
         json.dumps(
             {
                 "job_id": status.job_id,
                 "state": status.state,
-                "done": status.done.model_dump(mode="json") if status.done else None,
+                "done": done,
             },
             default=str,
             separators=(",", ":"),

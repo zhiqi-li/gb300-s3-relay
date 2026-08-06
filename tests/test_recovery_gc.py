@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -45,6 +47,22 @@ class FailReadyOnceStore(MemoryObjectStore):
         )
 
 
+class ReadyRaceStore(MemoryObjectStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.barrier = threading.Barrier(2)
+
+    def put_bytes(self, key, data, *, content_type="application/octet-stream", if_absent=False):
+        if key.endswith("/READY.json") and if_absent:
+            self.barrier.wait(timeout=2)
+        return super().put_bytes(
+            key,
+            data,
+            content_type=content_type,
+            if_absent=if_absent,
+        )
+
+
 def make_client(store: MemoryObjectStore) -> RelayClient:
     return RelayClient(
         store,
@@ -55,6 +73,67 @@ def make_client(store: MemoryObjectStore) -> RelayClient:
 
 
 class RecoveryAndGcTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compact_idempotent_submission_race_converges(self) -> None:
+        store = ReadyRaceStore()
+        relay = RelayClient(
+            store,
+            prefix="relay/v1",
+            media_policy=MediaPolicy(),
+            compact_protocol=True,
+        )
+        arguments = {
+            "endpoint": "/v1/chat/completions",
+            "body": {"model": "m", "messages": []},
+            "target": "gb300-1",
+            "timeout_seconds": 30,
+            "idempotency_key": "compact-race",
+        }
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            handles = list(executor.map(lambda _: relay.submit(**arguments), range(2)))
+        self.assertEqual(handles[0].job_id, handles[1].job_id)
+        self.assertEqual(handles[0].submitted_at, handles[1].submitted_at)
+
+    async def test_gc_collects_compact_terminal_jobs(self) -> None:
+        store = MemoryObjectStore()
+        relay = RelayClient(
+            store,
+            prefix="relay/v1",
+            media_policy=MediaPolicy(),
+            poll_interval_seconds=0.001,
+            compact_protocol=True,
+        )
+        handle = relay.submit(
+            endpoint="/v1/chat/completions",
+            body={"model": "m", "messages": []},
+            target="gb300-1",
+            timeout_seconds=30,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            worker = RelayWorker(
+                store,
+                prefix="relay/v1",
+                config=WorkerConfig(
+                    target="gb300-1",
+                    worker_id="worker-1",
+                    work_dir=Path(directory),
+                    lease_seconds=30,
+                    lease_heartbeat_seconds=5,
+                ),
+                upstream=OneShotUpstream(),
+            )
+            await worker.process(handle.job_id)
+        relay.wait(handle, timeout_seconds=1, cleanup=False)
+        collector = GarbageCollector(
+            store,
+            prefix="relay/v1",
+            config=RetentionConfig(succeeded_seconds=60),
+        )
+        report = collector.collect(
+            apply=True, now=datetime.now(UTC) + timedelta(seconds=61)
+        )
+        self.assertEqual(report.terminal_jobs_removed, 1)
+        self.assertEqual(report.errors, ())
+
     async def test_idempotent_retry_repairs_partial_submission(self) -> None:
         store = FailReadyOnceStore()
         relay = make_client(store)

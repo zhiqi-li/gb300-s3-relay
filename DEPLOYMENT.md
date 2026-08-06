@@ -107,6 +107,10 @@ sudo -u gb300-relay /opt/gb300-s3-relay/.venv/bin/gb300-relay doctor \
 Require `bucket=ok`, `conditional_create=ok`, `s5cmd_round_trip=ok`, and a nonzero cleanup
 count. Then install the unit and enable the target instance:
 
+For upgrades that introduce compact protocol support, roll and validate every worker before
+enabling `gateway.compact_protocol`. New workers accept both the standard and compact formats;
+an older worker cannot read a compact `READY.json`.
+
 ```bash
 sudo install -m 0644 /opt/gb300-s3-relay/systemd/gb300-relay-worker@.service \
   /etc/systemd/system/gb300-relay-worker@.service

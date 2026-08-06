@@ -10,6 +10,7 @@ addressing_style = "path"
 verify_tls = true
 retry_count = 10
 max_pool_connections = 128
+native_transfer_max_bytes = 8388608
 
 [gateway]
 host = "127.0.0.1"
@@ -17,10 +18,13 @@ port = 8080
 targets = ["gb300-1", "gb300-2"]
 default_timeout_seconds = 900
 max_timeout_seconds = 7200
+poll_interval_seconds = 0.2
 target_heartbeat_ttl_seconds = 45
 require_healthy_worker = true
 cleanup_on_success = true
 cleanup_idempotent_on_success = false
+compact_protocol = true
+compact_manifest_max_bytes = 1048576
 max_json_body_bytes = 1073741824
 # Set this to an environment-variable name when binding beyond loopback.
 # auth_token_env = "GB300_RELAY_GATEWAY_TOKEN"

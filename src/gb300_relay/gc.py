@@ -47,13 +47,15 @@ class GarbageCollector:
                 continue
             try:
                 done = DoneMarker.model_validate_json(
-                    self.store.get_bytes(item.key, max_bytes=64 * 1024)
+                    self.store.get_bytes(item.key, max_bytes=24 * 1024**2)
                 )
-                metadata = RelayResponse.model_validate_json(
-                    self.store.get_bytes(
-                        self.layout.response_metadata(job_id), max_bytes=4 * 1024**2
+                metadata = done.response
+                if metadata is None:
+                    metadata = RelayResponse.model_validate_json(
+                        self.store.get_bytes(
+                            self.layout.response_metadata(job_id), max_bytes=4 * 1024**2
+                        )
                     )
-                )
             except Exception as exc:
                 errors.append(f"{job_id}: {exc}")
                 continue

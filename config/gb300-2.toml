@@ -10,13 +10,18 @@ addressing_style = "path"
 verify_tls = true
 retry_count = 10
 max_pool_connections = 128
+native_transfer_max_bytes = 8388608
 
 [worker]
 target = "gb300-2"
 worker_id = "gb300-2-worker-1"
 upstream_base_url = "http://127.0.0.1:8080"
-max_concurrency = 16
+max_concurrency = 64
+max_heavy_concurrency = 8
+heavy_request_threshold_bytes = 131072
 asset_transfer_concurrency = 8
+poll_interval_seconds = 0.1
+poll_jitter_seconds = 0.1
 lease_seconds = 1800
 lease_heartbeat_seconds = 60
 worker_heartbeat_seconds = 10
@@ -28,8 +33,9 @@ work_dir = "/var/tmp/gb300-relay"
 media_delivery = "auto"
 inline_image_max_bytes = 33554432
 max_response_bytes = 536870912
+compact_response_max_bytes = 1048576
 stream_chunk_bytes = 262144
-stream_flush_interval_seconds = 0.5
+stream_flush_interval_seconds = 0.1
 models = []
 
 [metrics]

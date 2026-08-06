@@ -58,6 +58,7 @@ class OfficialOpenAISdkTests(unittest.IsolatedAsyncioTestCase):
             prefix="relay/v1",
             media_policy=MediaPolicy(),
             poll_interval_seconds=0.001,
+            compact_protocol=True,
         )
         app = create_app(
             store,
@@ -66,6 +67,7 @@ class OfficialOpenAISdkTests(unittest.IsolatedAsyncioTestCase):
                 targets=("gb300-1",),
                 require_healthy_worker=False,
                 poll_interval_seconds=0.001,
+                compact_protocol=True,
             ),
             prefix="relay/v1",
         )

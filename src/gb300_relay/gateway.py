@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .client import RelayClient
 from .config import GatewayConfig
@@ -57,34 +58,63 @@ class TargetSelector:
         self._lock = threading.Lock()
         self._cache_at = 0.0
         self._cache: dict[str, list[WorkerHeartbeat]] = {}
+        self._refreshing = False
         self._round_robin = 0
+
+    def _fetch_workers(self) -> dict[str, list[WorkerHeartbeat]]:
+        grouped: dict[str, list[WorkerHeartbeat]] = {
+            target: [] for target in self.config.targets
+        }
+        now = datetime.now(UTC)
+        for item in self.store.list(self.layout.worker_prefix()):
+            try:
+                heartbeat = WorkerHeartbeat.model_validate_json(
+                    self.store.get_bytes(item.key, max_bytes=64 * 1024)
+                )
+            except Exception:
+                continue
+            observed_at = item.last_modified or heartbeat.updated_at
+            age = (now - observed_at).total_seconds()
+            if (
+                heartbeat.target in grouped
+                and heartbeat.healthy
+                and -30 <= age <= self.config.target_heartbeat_ttl_seconds
+            ):
+                grouped[heartbeat.target].append(heartbeat)
+        return grouped
+
+    def _refresh_in_background(self) -> None:
+        try:
+            grouped = self._fetch_workers()
+        except Exception:
+            log_event(LOGGER, logging.WARNING, "worker_cache_refresh_failed", exc_info=True)
+        else:
+            with self._lock:
+                self._cache = grouped
+                self._cache_at = time.monotonic()
+        finally:
+            with self._lock:
+                self._refreshing = False
 
     def _workers(self, *, force: bool = False) -> dict[str, list[WorkerHeartbeat]]:
         now_monotonic = time.monotonic()
         with self._lock:
-            if not force and now_monotonic - self._cache_at < self.cache_seconds:
+            is_fresh = now_monotonic - self._cache_at < self.cache_seconds
+            if not force and is_fresh:
                 return self._cache
-            grouped: dict[str, list[WorkerHeartbeat]] = {
-                target: [] for target in self.config.targets
-            }
-            now = datetime.now(UTC)
-            for item in self.store.list(self.layout.worker_prefix()):
-                try:
-                    heartbeat = WorkerHeartbeat.model_validate_json(
-                        self.store.get_bytes(item.key, max_bytes=64 * 1024)
-                    )
-                except Exception:
-                    continue
-                observed_at = item.last_modified or heartbeat.updated_at
-                age = (now - observed_at).total_seconds()
-                if (
-                    heartbeat.target in grouped
-                    and heartbeat.healthy
-                    and -30 <= age <= self.config.target_heartbeat_ttl_seconds
-                ):
-                    grouped[heartbeat.target].append(heartbeat)
+            if not force and self._cache_at > 0:
+                if not self._refreshing:
+                    self._refreshing = True
+                    threading.Thread(
+                        target=self._refresh_in_background,
+                        name="gb300-worker-cache-refresh",
+                        daemon=True,
+                    ).start()
+                return self._cache
+        grouped = self._fetch_workers()
+        with self._lock:
             self._cache = grouped
-            self._cache_at = now_monotonic
+            self._cache_at = time.monotonic()
             return grouped
 
     def select(self, *, requested: str | None = None, model: str | None = None) -> str:
@@ -136,7 +166,7 @@ def create_app(
     prefix: str,
     metrics: RelayMetrics | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="GB300 S3 Relay", version="0.1.0")
+    app = FastAPI(title="GB300 S3 Relay", version="0.2.0")
     layout = ObjectLayout(prefix)
     selector = TargetSelector(store, layout, config)
     relay_metrics = metrics or RelayMetrics("gateway")
@@ -145,6 +175,21 @@ def create_app(
         raise ConfigurationError(
             f"gateway authentication variable is unset: {config.auth_token_env}"
         )
+
+    def finalize_job(target: str, job_id: str, cleanup: bool) -> None:
+        try:
+            relay_client.acknowledge(job_id)
+            if cleanup:
+                relay_client.cleanup(target=target, job_id=job_id)
+        except Exception:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "finalize_failed",
+                job_id=job_id,
+                target=target,
+                exc_info=True,
+            )
 
     def authenticate(request: Request) -> Response | None:
         if expected_auth is None:
@@ -333,6 +378,7 @@ def create_app(
                 handle,
                 timeout_seconds=timeout,
                 cleanup=False,
+                acknowledge=False,
             )
         except TimeoutError as exc:
             await asyncio.to_thread(relay_client.cancel, handle.job_id)
@@ -367,18 +413,7 @@ def create_app(
         cleanup_success = config.cleanup_on_success and (
             not request.headers.get("idempotency-key") or config.cleanup_idempotent_on_success
         )
-        if cleanup_success and completed.metadata.status == JobStatus.SUCCEEDED:
-            try:
-                await asyncio.to_thread(relay_client.cleanup, target=target, job_id=handle.job_id)
-            except Exception:
-                log_event(
-                    LOGGER,
-                    logging.WARNING,
-                    "cleanup_failed",
-                    job_id=handle.job_id,
-                    target=target,
-                    exc_info=True,
-                )
+        cleanup_job = cleanup_success and completed.metadata.status == JobStatus.SUCCEEDED
         outcome = completed.metadata.status.value.lower()
         relay_metrics.requests.labels("gateway", target, endpoint, outcome).inc()
         relay_metrics.bytes.labels("gateway", target, "download").inc(len(completed.body))
@@ -387,6 +422,7 @@ def create_app(
             status_code=completed.metadata.http_status,
             media_type=completed.metadata.content_type.split(";", 1)[0],
             headers=response_headers,
+            background=BackgroundTask(finalize_job, target, handle.job_id, cleanup_job),
         )
 
     return app

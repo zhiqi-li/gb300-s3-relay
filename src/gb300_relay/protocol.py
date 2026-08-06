@@ -113,6 +113,8 @@ class ReadyMarker(StrictModel):
     job_id: str = Field(pattern=SAFE_ID_PATTERN)
     target: str = Field(pattern=SAFE_ID_PATTERN)
     manifest_sha256: str = Field(pattern=SHA256_PATTERN)
+    manifest_base64: str | None = Field(default=None, max_length=24 * 1024**2)
+    compact_response: bool = False
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -161,7 +163,8 @@ class RelayResponse(StrictModel):
     attempt: int = Field(ge=1)
     http_status: int = Field(ge=100, le=599)
     content_type: str = Field(min_length=1, max_length=255)
-    body_object: str = Field(min_length=1, max_length=512)
+    body_object: str | None = Field(default=None, min_length=1, max_length=512)
+    body_base64: str | None = Field(default=None, max_length=24 * 1024**2)
     body_sha256: str = Field(pattern=SHA256_PATTERN)
     body_size_bytes: int = Field(ge=0)
     response_headers: dict[str, str] = Field(default_factory=dict)
@@ -174,6 +177,8 @@ class RelayResponse(StrictModel):
             raise ValueError("successful response cannot include failure")
         if self.status != JobStatus.SUCCEEDED and self.failure is None:
             raise ValueError("non-successful response must include failure")
+        if (self.body_object is None) == (self.body_base64 is None):
+            raise ValueError("exactly one of body_object or body_base64 is required")
         return self
 
 
@@ -182,6 +187,7 @@ class DoneMarker(StrictModel):
     job_id: str = Field(pattern=SAFE_ID_PATTERN)
     status: JobStatus
     response_sha256: str = Field(pattern=SHA256_PATTERN)
+    response: RelayResponse | None = None
     completed_at: datetime = Field(default_factory=utc_now)
     stream_chunk_count: int | None = Field(default=None, ge=0)
 

@@ -195,6 +195,7 @@ that defaults to reasoning mode, add `--disable-thinking` to exercise visible re
 - [`config/osmo-gateway.toml`](config/osmo-gateway.toml): client-side gateway template.
 - [`config/gb300-1.toml`](config/gb300-1.toml) and [`config/gb300-2.toml`](config/gb300-2.toml): worker templates.
 - [`AGENT_INTEGRATION.md`](AGENT_INTEGRATION.md): deterministic integration contract for deployment agents.
+- [`DEPLOYMENT.md`](DEPLOYMENT.md): persistent systemd worker installation and operations.
 - [`PROTOCOL.md`](PROTOCOL.md): object layout, commit markers, and failure semantics.
 - [`systemd/`](systemd): long-running gateway and worker units.
 - [`docker/Dockerfile`](docker/Dockerfile): multi-architecture image definition.

@@ -58,6 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("--endpoint", default="/v1/chat/completions")
     submit.add_argument("--timeout", type=float, default=900)
     submit.add_argument("--idempotency-key")
+    submit.add_argument("--producer-group")
 
     wait = with_config("wait", "wait for and print one relay result")
     wait.add_argument("--job-id", required=True)
@@ -70,6 +71,7 @@ def _parser() -> argparse.ArgumentParser:
     cleanup = with_config("cleanup", "delete one exact acknowledged job")
     cleanup.add_argument("--job-id", required=True)
     cleanup.add_argument("--target", required=True)
+    cleanup.add_argument("--producer-group")
 
     gc = with_config("gc", "collect old acknowledged jobs and stale worker heartbeats")
     gc.add_argument(
@@ -86,6 +88,7 @@ def _client(config: AppConfig, store: S3ObjectStore) -> RelayClient:
         store,
         prefix=config.s3.prefix,
         client_id=gateway.client_id,
+        producer_group=gateway.producer_group,
         media_policy=gateway.media,
         poll_interval_seconds=gateway.poll_interval_seconds,
         compact_protocol=gateway.compact_protocol,
@@ -215,6 +218,7 @@ def _submit(config: AppConfig, args: argparse.Namespace) -> int:
             target=args.target,
             timeout_seconds=args.timeout,
             idempotency_key=args.idempotency_key,
+            producer_group=args.producer_group,
         )
     print(handle.model_dump_json())
     return 0
@@ -255,7 +259,11 @@ def _status(config: AppConfig, args: argparse.Namespace) -> int:
 
 def _cleanup(config: AppConfig, args: argparse.Namespace) -> int:
     with S3ObjectStore(config.s3) as store:
-        removed = _client(config, store).cleanup(target=args.target, job_id=args.job_id)
+        removed = _client(config, store).cleanup(
+            target=args.target,
+            job_id=args.job_id,
+            producer_group=args.producer_group,
+        )
     print(json.dumps({"job_id": args.job_id, "removed_objects": removed}, separators=(",", ":")))
     return 0
 

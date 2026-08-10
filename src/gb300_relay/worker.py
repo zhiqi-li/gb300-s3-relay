@@ -7,7 +7,8 @@ import logging
 import random
 import tempfile
 import time
-from contextlib import nullcontext, suppress
+from collections import Counter, OrderedDict, defaultdict, deque
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,7 @@ from .protocol import (
     RelayResponse,
     WorkerHeartbeat,
     canonical_json_bytes,
+    request_fingerprint,
     sha256_bytes,
 )
 from .storage import ObjectStore, sha256_file
@@ -72,6 +74,117 @@ class ProcessOutcome:
     status: JobStatus | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class QueuedJob:
+    job_id: str
+    producer_group: str | None
+
+
+@dataclass(slots=True)
+class _TransferTicket:
+    producer_group: str | None
+    size_bytes: int
+    future: asyncio.Future[None]
+    granted: bool = False
+
+
+class FairTransferLimiter:
+    """Global transfer slots allocated with byte-based deficit round-robin."""
+
+    def __init__(self, concurrency: int, quantum_bytes: int) -> None:
+        if concurrency < 1 or quantum_bytes < 1:
+            raise ValueError("transfer concurrency and quantum must be positive")
+        self.concurrency = concurrency
+        self.quantum_bytes = quantum_bytes
+        self._active = 0
+        self._queues: dict[str | None, deque[_TransferTicket]] = {}
+        self._groups: deque[str | None] = deque()
+        self._deficits: dict[str | None, int] = {}
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    @property
+    def pending(self) -> int:
+        return sum(len(queue) for queue in self._queues.values())
+
+    async def acquire(self, producer_group: str | None, size_bytes: int) -> None:
+        loop = asyncio.get_running_loop()
+        ticket = _TransferTicket(
+            producer_group=producer_group,
+            size_bytes=max(1, size_bytes),
+            future=loop.create_future(),
+        )
+        queue = self._queues.get(producer_group)
+        if queue is None:
+            queue = deque()
+            self._queues[producer_group] = queue
+            self._groups.append(producer_group)
+            self._deficits[producer_group] = 0
+        queue.append(ticket)
+        self._dispatch()
+        try:
+            await ticket.future
+        except asyncio.CancelledError:
+            if ticket.granted:
+                # Cancellation can land after dispatch grants a slot but before
+                # the waiting task resumes. Return that slot instead of leaking it.
+                self.release()
+            else:
+                if not ticket.future.done():
+                    ticket.future.cancel()
+                queue = self._queues.get(producer_group)
+                if queue is not None:
+                    with suppress(ValueError):
+                        queue.remove(ticket)
+                self._dispatch()
+            raise
+
+    def release(self) -> None:
+        if self._active < 1:
+            raise RuntimeError("transfer limiter released without an active slot")
+        self._active -= 1
+        self._dispatch()
+
+    @asynccontextmanager
+    async def slot(self, producer_group: str | None, size_bytes: int):
+        await self.acquire(producer_group, size_bytes)
+        try:
+            yield
+        finally:
+            self.release()
+
+    def _dispatch(self) -> None:
+        while self._active < self.concurrency and self._groups:
+            producer_group = self._groups.popleft()
+            queue = self._queues.get(producer_group)
+            if queue is None:
+                continue
+            while queue and queue[0].future.cancelled():
+                queue.popleft()
+            if not queue:
+                self._queues.pop(producer_group, None)
+                self._deficits.pop(producer_group, None)
+                continue
+            self._deficits[producer_group] += self.quantum_bytes
+            ticket = queue[0]
+            if ticket.size_bytes > self._deficits[producer_group]:
+                self._groups.append(producer_group)
+                continue
+            queue.popleft()
+            self._deficits[producer_group] -= ticket.size_bytes
+            self._active += 1
+            if queue:
+                self._groups.append(producer_group)
+            else:
+                self._queues.pop(producer_group, None)
+                self._deficits.pop(producer_group, None)
+            ticket.granted = True
+            if not ticket.future.done():
+                ticket.future.set_result(None)
+
+
 class RelayWorker:
     def __init__(
         self,
@@ -91,29 +204,124 @@ class RelayWorker:
         self._heavy_slots = asyncio.Semaphore(
             min(config.max_heavy_concurrency, config.max_concurrency)
         )
+        self._asset_transfers = FairTransferLimiter(
+            config.asset_transfer_concurrency,
+            config.asset_fairness_quantum_bytes,
+        )
         self._inflight: dict[str, asyncio.Task[ProcessOutcome]] = {}
+        self._inflight_groups: dict[str, str | None] = {}
+        self._terminal_jobs: OrderedDict[str, None] = OrderedDict()
+        self._group_cursor = 0
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
         self._stop.set()
 
-    def ready_jobs(self) -> list[str]:
-        objects = self.store.list(self.layout.target_ready_prefix(self.config.target))
-        jobs = {
-            job_id
-            for item in objects
-            if (job_id := self.layout.parse_ready_key(item.key, self.config.target)) is not None
+    def ready_entries(self) -> list[QueuedJob]:
+        """Discover queue markers and interleave producer hardware groups fairly."""
+
+        entries = {
+            QueuedJob(job_id=job_id, producer_group=producer_group)
+            for item in self.store.list(self.layout.grouped_ready_prefix(self.config.target))
+            if (parsed := self.layout.parse_grouped_ready_key(item.key, self.config.target))
+            is not None
+            for producer_group, job_id in (parsed,)
         }
-        return sorted(jobs)
+        if self.config.scan_legacy_ready:
+            entries.update(
+                QueuedJob(job_id=job_id, producer_group=None)
+                for item in self.store.list(self.layout.target_ready_prefix(self.config.target))
+                if (job_id := self.layout.parse_ready_key(item.key, self.config.target)) is not None
+            )
+        return self._fair_order(entries)
+
+    def ready_jobs(self) -> list[str]:
+        """Backward-compatible view of currently queued job identifiers."""
+
+        return [entry.job_id for entry in self.ready_entries()]
+
+    def _fair_order(self, entries: set[QueuedJob]) -> list[QueuedJob]:
+        grouped: dict[str | None, deque[QueuedJob]] = defaultdict(deque)
+        for entry in sorted(
+            entries,
+            key=lambda item: (item.producer_group or "", item.job_id),
+        ):
+            grouped[entry.producer_group].append(entry)
+        groups = sorted(grouped, key=lambda item: item or "")
+        if not groups:
+            return []
+        offset = self._group_cursor % len(groups)
+        groups = groups[offset:] + groups[:offset]
+        self._group_cursor = (self._group_cursor + 1) % len(groups)
+        ordered: list[QueuedJob] = []
+        while groups:
+            active: list[str | None] = []
+            for producer_group in groups:
+                ordered.append(grouped[producer_group].popleft())
+                if grouped[producer_group]:
+                    active.append(producer_group)
+            groups = active
+        return ordered
+
+    def _remember_terminal(self, job_id: str) -> None:
+        if self.config.terminal_cache_size == 0:
+            return
+        self._terminal_jobs.pop(job_id, None)
+        self._terminal_jobs[job_id] = None
+        while len(self._terminal_jobs) > self.config.terminal_cache_size:
+            self._terminal_jobs.popitem(last=False)
+
+    def _ready_key(self, job_id: str, producer_group: str | None) -> str:
+        if producer_group is None:
+            return self.layout.ready(self.config.target, job_id)
+        return self.layout.grouped_ready(self.config.target, producer_group, job_id)
 
     def _is_cancelled(self, job_id: str) -> bool:
         return self.store.head(self.layout.cancel(job_id)) is not None
 
-    def _is_ready(self, job_id: str) -> bool:
-        return self.store.head(self.layout.ready(self.config.target, job_id)) is not None
+    def _is_ready(self, job_id: str, producer_group: str | None = None) -> bool:
+        return self.store.head(self._ready_key(job_id, producer_group)) is not None
 
     def _is_done(self, job_id: str) -> bool:
         return self.store.head(self.layout.done(job_id)) is not None
+
+    async def _pending_entries(self, entries: list[QueuedJob]) -> list[QueuedJob]:
+        candidates = [
+            entry
+            for entry in entries
+            if entry.job_id not in self._inflight and entry.job_id not in self._terminal_jobs
+        ]
+        if not candidates:
+            return []
+        done_flags = await asyncio.gather(
+            *(asyncio.to_thread(self._is_done, entry.job_id) for entry in candidates),
+            return_exceptions=True,
+        )
+        pending: list[QueuedJob] = []
+        for entry, done in zip(candidates, done_flags, strict=True):
+            if done is True:
+                self._remember_terminal(entry.job_id)
+            elif done is False:
+                pending.append(entry)
+            else:
+                self.metrics.poll_errors.labels("worker", self.config.target).inc()
+        return pending
+
+    def _select_entries(self, entries: list[QueuedJob], available: int) -> list[QueuedJob]:
+        if available <= 0:
+            return []
+        limit = self.config.max_concurrency_per_producer or self.config.max_concurrency
+        limit = min(limit, self.config.max_concurrency)
+        group_counts: Counter[str | None] = Counter(self._inflight_groups.values())
+        selected: list[QueuedJob] = []
+        for entry in entries:
+            if len(selected) >= available:
+                break
+            if group_counts[entry.producer_group] >= limit:
+                continue
+            selected.append(entry)
+            group_counts[entry.producer_group] += 1
+        return selected
 
     async def run_forever(self) -> None:
         heartbeat = asyncio.create_task(self._worker_heartbeat_loop(), name="worker-heartbeat")
@@ -123,7 +331,7 @@ class RelayWorker:
                 available = self.config.max_concurrency - len(self._inflight)
                 if available > 0:
                     try:
-                        jobs = await asyncio.to_thread(self.ready_jobs)
+                        entries = await asyncio.to_thread(self.ready_entries)
                     except Exception:
                         self.metrics.poll_errors.labels("worker", self.config.target).inc()
                         log_event(
@@ -133,25 +341,19 @@ class RelayWorker:
                             target=self.config.target,
                             exc_info=True,
                         )
-                        jobs = []
-                    if jobs:
-                        done_flags = await asyncio.gather(
-                            *(asyncio.to_thread(self._is_done, job) for job in jobs),
-                            return_exceptions=True,
-                        )
-                        jobs = [
-                            job for job, done in zip(jobs, done_flags, strict=True) if done is False
-                        ]
-                    for job_id in jobs:
-                        if available <= 0:
-                            break
-                        if job_id in self._inflight:
-                            continue
+                        entries = []
+                    pending = await self._pending_entries(entries)
+                    for entry in self._select_entries(pending, available):
                         task = asyncio.create_task(
-                            self.process(job_id, discovered=True), name=f"job:{job_id}"
+                            self.process(
+                                entry.job_id,
+                                producer_group=entry.producer_group,
+                                discovered=True,
+                            ),
+                            name=f"job:{entry.job_id}",
                         )
-                        self._inflight[job_id] = task
-                        available -= 1
+                        self._inflight[entry.job_id] = task
+                        self._inflight_groups[entry.job_id] = entry.producer_group
                 self.metrics.inflight.labels("worker", self.config.target).set(len(self._inflight))
                 delay = self.config.poll_interval_seconds + random.uniform(
                     0, self.config.poll_jitter_seconds
@@ -175,26 +377,30 @@ class RelayWorker:
 
         outcomes: list[ProcessOutcome] = []
         while True:
-            candidates = await asyncio.to_thread(self.ready_jobs)
-            done_flags = await asyncio.gather(
-                *(asyncio.to_thread(self._is_done, job) for job in candidates)
-            )
-            jobs = [job for job, is_done in zip(candidates, done_flags, strict=True) if not is_done]
-            if not jobs:
+            entries = await asyncio.to_thread(self.ready_entries)
+            pending = await self._pending_entries(entries)
+            batch = self._select_entries(pending, self.config.max_concurrency)
+            if not batch:
                 return outcomes
-            for offset in range(0, len(jobs), self.config.max_concurrency):
-                batch = jobs[offset : offset + self.config.max_concurrency]
-                outcomes.extend(
-                    await asyncio.gather(
-                        *(self.process(job, discovered=True) for job in batch)
+            outcomes.extend(
+                await asyncio.gather(
+                    *(
+                        self.process(
+                            entry.job_id,
+                            producer_group=entry.producer_group,
+                            discovered=True,
+                        )
+                        for entry in batch
                     )
                 )
+            )
 
     def _reap_tasks(self) -> None:
         for job_id, task in list(self._inflight.items()):
             if not task.done():
                 continue
             del self._inflight[job_id]
+            self._inflight_groups.pop(job_id, None)
             try:
                 task.result()
             except asyncio.CancelledError:
@@ -260,12 +466,12 @@ class RelayWorker:
                     exc_info=True,
                 )
 
-    async def _download_request(
-        self, job_id: str, directory: Path
-    ) -> tuple[ReadyMarker, RelayRequest, dict[str, Path]]:
+    async def _load_request(
+        self, job_id: str, producer_group: str | None
+    ) -> tuple[ReadyMarker, RelayRequest]:
         ready_data = await asyncio.to_thread(
             self.store.get_bytes,
-            self.layout.ready(self.config.target, job_id),
+            self._ready_key(job_id, producer_group),
             max_bytes=24 * 1024**2,
         )
         ready = ReadyMarker.model_validate_json(ready_data)
@@ -283,38 +489,61 @@ class RelayWorker:
         if sha256_bytes(manifest_data) != ready.manifest_sha256:
             raise IntegrityError(f"manifest digest mismatch for {job_id}")
         request = RelayRequest.model_validate_json(manifest_data)
-        if request.job_id != job_id or request.target != self.config.target:
+        if (
+            ready.job_id != job_id
+            or ready.target != self.config.target
+            or ready.producer_group != producer_group
+            or request.job_id != job_id
+            or request.target != self.config.target
+            or request.producer_group != producer_group
+        ):
             raise IntegrityError(f"manifest identity mismatch for {job_id}")
         if request.endpoint not in self.config.allowed_endpoints:
             raise InvalidRequestError(f"endpoint is not allowed: {request.endpoint}")
+        return ready, request
+
+    async def _download_assets(self, request: RelayRequest, directory: Path) -> dict[str, Path]:
         assets_directory = directory / "assets"
         assets_directory.mkdir(parents=True, exist_ok=True)
         asset_paths: dict[str, Path] = {}
-        semaphore = asyncio.Semaphore(self.config.asset_transfer_concurrency)
+        request_semaphore = asyncio.Semaphore(self.config.asset_transfer_concurrency)
 
         async def download(descriptor) -> None:
             path = assets_directory / descriptor.filename
-            async with semaphore:
+            if self.config.asset_transfer_scope == "worker":
+                transfer_slot = self._asset_transfers.slot(
+                    request.producer_group,
+                    descriptor.size_bytes,
+                )
+            else:
+                transfer_slot = request_semaphore
+            async with transfer_slot:
                 await asyncio.to_thread(
                     self.store.download_file,
                     self.layout.asset(self.config.target, request.job_id, descriptor.object_name),
                     path,
                     expected_size_bytes=descriptor.size_bytes,
                 )
-            if path.stat().st_size != descriptor.size_bytes:
-                raise IntegrityError(f"asset size mismatch: {descriptor.asset_id}")
-            digest = await asyncio.to_thread(sha256_file, path)
-            if digest != descriptor.sha256:
-                raise IntegrityError(f"asset digest mismatch: {descriptor.asset_id}")
+                if path.stat().st_size != descriptor.size_bytes:
+                    raise IntegrityError(f"asset size mismatch: {descriptor.asset_id}")
+                digest = await asyncio.to_thread(sha256_file, path)
+                if digest != descriptor.sha256:
+                    raise IntegrityError(f"asset digest mismatch: {descriptor.asset_id}")
             asset_paths[descriptor.asset_id] = path
 
         await asyncio.gather(*(download(descriptor) for descriptor in request.assets))
-        return ready, request, asset_paths
+        return asset_paths
 
-    async def process(self, job_id: str, *, discovered: bool = False) -> ProcessOutcome:
+    async def process(
+        self,
+        job_id: str,
+        *,
+        producer_group: str | None = None,
+        discovered: bool = False,
+    ) -> ProcessOutcome:
         # LIST results can briefly outlive a concurrently deleted READY marker.
         # Always confirm the commit marker before creating a lease generation.
-        if not await asyncio.to_thread(self._is_ready, job_id):
+        if not await asyncio.to_thread(self._is_ready, job_id, producer_group):
             return ProcessOutcome(job_id, handled=False)
         if not discovered and await asyncio.to_thread(self._is_done, job_id):
             return ProcessOutcome(job_id, handled=False)
@@ -331,12 +560,10 @@ class RelayWorker:
         # A client can acknowledge and clean a result after queue discovery but
         # before this coroutine acquires its claim. Recheck both markers so a stale
         # READY listing cannot resurrect an already delivered request.
-        if not await asyncio.to_thread(self._is_ready, job_id):
+        if not await asyncio.to_thread(self._is_ready, job_id, producer_group):
             await asyncio.to_thread(
                 self.store.delete_prefix,
-                self.layout.claim_generation_prefix(
-                    token.target, token.job_id, token.generation
-                ),
+                self.layout.claim_generation_prefix(token.target, token.job_id, token.generation),
             )
             return ProcessOutcome(job_id, handled=False)
         started = time.monotonic()
@@ -350,7 +577,7 @@ class RelayWorker:
                 prefix=f"{job_id}-", dir=self.config.work_dir
             ) as raw_directory:
                 directory = Path(raw_directory)
-                ready, request, assets = await self._download_request(job_id, directory)
+                ready, request = await self._load_request(job_id, producer_group)
                 endpoint = request.endpoint
                 if request.expires_at <= datetime.now(UTC):
                     status = await self._publish_error(
@@ -378,11 +605,14 @@ class RelayWorker:
                         compact_response=ready.compact_response,
                     )
                     return ProcessOutcome(job_id, handled=True, status=status)
-                is_heavy = bool(request.assets) or len(
-                    canonical_json_bytes(request.body)
-                ) >= self.config.heavy_request_threshold_bytes
+                is_heavy = (
+                    bool(request.assets)
+                    or len(canonical_json_bytes(request.body))
+                    >= self.config.heavy_request_threshold_bytes
+                )
                 limiter = self._heavy_slots if is_heavy else nullcontext()
                 async with limiter:
+                    assets = await self._download_assets(request, directory)
                     body = restore_asset_references(
                         request.body,
                         request.assets,
@@ -416,6 +646,7 @@ class RelayWorker:
                 request = RelayRequest(
                     job_id=job_id,
                     target=self.config.target,
+                    producer_group=producer_group,
                     endpoint="/v1/chat/completions",
                     created_at=now,
                     expires_at=now + timedelta(minutes=5),
@@ -452,6 +683,7 @@ class RelayWorker:
                 "job_finished",
                 job_id=job_id,
                 target=self.config.target,
+                producer_group=producer_group,
                 status=status.value,
                 duration_seconds=round(elapsed, 6),
             )
@@ -769,9 +1001,7 @@ class RelayWorker:
     ) -> None:
         body_size = response_path.stat().st_size
         body_digest = await asyncio.to_thread(sha256_file, response_path)
-        use_compact = (
-            compact_response and body_size <= self.config.compact_response_max_bytes
-        )
+        use_compact = compact_response and body_size <= self.config.compact_response_max_bytes
         body_key: str | None = None
         body_base64: str | None = None
         await asyncio.to_thread(self.leases.assert_owner, token)
@@ -786,6 +1016,7 @@ class RelayWorker:
         metadata = RelayResponse(
             job_id=request.job_id,
             target=request.target,
+            producer_group=request.producer_group,
             worker_id=self.config.worker_id,
             status=status,
             created_at=request.created_at,
@@ -822,6 +1053,11 @@ class RelayWorker:
             status=status,
             response_sha256=sha256_bytes(metadata_data),
             response=metadata if use_compact else None,
+            producer_group=request.producer_group,
+            request_fingerprint=request_fingerprint(request),
+            request_created_at=request.created_at,
+            request_expires_at=request.expires_at,
+            trace_id=request.trace_id,
             stream_chunk_count=stream_chunk_count,
         )
         try:
@@ -838,6 +1074,7 @@ class RelayWorker:
             )
             if existing.response_sha256 != done.response_sha256:
                 raise IntegrityError(f"DONE marker collision for {request.job_id}") from exc
+        self._remember_terminal(request.job_id)
         if status != JobStatus.SUCCEEDED:
             with suppress(ConditionalWriteFailed):
                 await asyncio.to_thread(
@@ -846,4 +1083,26 @@ class RelayWorker:
                     metadata_data,
                     content_type="application/json",
                     if_absent=True,
+                )
+        if request.producer_group is not None:
+            try:
+                await asyncio.to_thread(
+                    self.store.delete_keys,
+                    (
+                        self.layout.grouped_ready(
+                            request.target,
+                            request.producer_group,
+                            request.job_id,
+                        ),
+                    ),
+                )
+            except Exception:
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "queue_marker_cleanup_failed",
+                    job_id=request.job_id,
+                    target=request.target,
+                    producer_group=request.producer_group,
+                    exc_info=True,
                 )

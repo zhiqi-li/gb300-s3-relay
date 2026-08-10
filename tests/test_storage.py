@@ -7,16 +7,29 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
+from botocore.exceptions import ClientError
+
 from gb300_relay.config import S3Config
+from gb300_relay.errors import ConditionalWriteFailed
 from gb300_relay.storage import S3ObjectStore, S5CmdRunner
 
 
 class FakeS3Client:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.last_put_options: dict = {}
 
     def put_object(self, *, Bucket, Key, Body, **kwargs):
-        del Bucket, kwargs
+        del Bucket
+        self.last_put_options = kwargs
+        if kwargs.get("IfNoneMatch") == "*" and Key in self.objects:
+            raise ClientError(
+                {
+                    "Error": {"Code": "PreconditionFailed"},
+                    "ResponseMetadata": {"HTTPStatusCode": 412},
+                },
+                "PutObject",
+            )
         self.objects[Key] = Body.read() if hasattr(Body, "read") else bytes(Body)
         return {"ETag": "etag"}
 
@@ -34,6 +47,23 @@ class FakeS5Cmd:
 
 
 class S5CmdEnvironmentTests(unittest.TestCase):
+    def test_native_conditional_put_preserves_create_only_semantics(self) -> None:
+        config = S3Config(
+            bucket="relay-test",
+            endpoint_url="https://objects.example.test",
+        )
+        store = object.__new__(S3ObjectStore)
+        store.config = config
+        store.bucket = config.bucket
+        store._client = FakeS3Client()
+        store._native_conditional_put = True
+
+        store.put_bytes("ready", b"one", if_absent=True)
+        self.assertEqual(store._client.last_put_options["IfNoneMatch"], "*")
+        with self.assertRaises(ConditionalWriteFailed):
+            store.put_bytes("ready", b"two", if_absent=True)
+        self.assertEqual(store._client.objects["ready"], b"one")
+
     def test_explicit_profile_isolated_from_ambient_credentials(self) -> None:
         config = S3Config(
             bucket="relay-test",

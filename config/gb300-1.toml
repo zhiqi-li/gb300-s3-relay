@@ -17,12 +17,21 @@ target = "gb300-1"
 worker_id = "gb300-1-worker-1"
 upstream_base_url = "http://127.0.0.1:8080"
 max_concurrency = 64
+# Optional hard isolation. Leave unset to let idle capacity be borrowed across groups.
+# max_concurrency_per_producer = 16
 max_heavy_concurrency = 8
 heavy_request_threshold_bytes = 131072
 thread_pool_workers = 128
-asset_transfer_concurrency = 8
+asset_transfer_concurrency = 16
+# Share this bound across every in-flight request in this worker process.
+asset_transfer_scope = "worker"
+# Deficit-round-robin byte quantum used between producer hardware groups.
+asset_fairness_quantum_bytes = 16777216
 poll_interval_seconds = 0.1
 poll_jitter_seconds = 0.1
+# Keep true during a rolling upgrade; set false after all legacy READY jobs drain.
+scan_legacy_ready = true
+terminal_cache_size = 100000
 lease_seconds = 1800
 lease_heartbeat_seconds = 60
 worker_heartbeat_seconds = 10

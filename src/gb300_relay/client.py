@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import re
 import tempfile
 import time
 import uuid
@@ -25,6 +26,7 @@ from .errors import (
 from .layout import ObjectLayout
 from .media import MediaMaterializer
 from .protocol import (
+    SAFE_ID_PATTERN,
     AckMarker,
     DoneMarker,
     JobHandle,
@@ -33,6 +35,7 @@ from .protocol import (
     RelayRequest,
     RelayResponse,
     canonical_json_bytes,
+    request_fingerprint,
     sha256_bytes,
 )
 from .storage import ObjectStore, sha256_file
@@ -46,6 +49,7 @@ _TERMINAL_SSE_MARKERS = (
     b"event:response.failed",
     b"event:response.incomplete",
 )
+_SAFE_PRODUCER_GROUP = re.compile(SAFE_ID_PATTERN)
 
 
 def _contains_terminal_sse_event(data: bytes) -> bool:
@@ -81,6 +85,7 @@ class RelayClient:
         *,
         prefix: str,
         client_id: str = "relay-client",
+        producer_group: str | None = None,
         media_policy: MediaPolicy | None = None,
         poll_interval_seconds: float = 0.5,
         upload_concurrency: int = 8,
@@ -90,18 +95,35 @@ class RelayClient:
         self.store = store
         self.layout = ObjectLayout(prefix)
         self.client_id = client_id
+        self.producer_group = self._validate_producer_group(producer_group)
         self.media_policy = media_policy or MediaPolicy()
         self.poll_interval_seconds = poll_interval_seconds
         self.upload_concurrency = max(1, upload_concurrency)
         self.compact_protocol = compact_protocol
         self.compact_manifest_max_bytes = max(0, compact_manifest_max_bytes)
 
-    def _job_id(self, target: str, idempotency_key: str | None) -> tuple[str, str | None]:
+    @staticmethod
+    def _validate_producer_group(producer_group: str | None) -> str | None:
+        if producer_group is not None and not _SAFE_PRODUCER_GROUP.fullmatch(producer_group):
+            raise InvalidRequestError(f"unsafe producer_group: {producer_group!r}")
+        return producer_group
+
+    def _ready_key(self, target: str, job_id: str, producer_group: str | None) -> str:
+        if producer_group is None:
+            return self.layout.ready(target, job_id)
+        return self.layout.grouped_ready(target, producer_group, job_id)
+
+    def _job_id(
+        self, target: str, idempotency_key: str | None, producer_group: str | None
+    ) -> tuple[str, str | None]:
         if idempotency_key is None:
             return f"job-{uuid.uuid4().hex}", None
         if not idempotency_key or len(idempotency_key.encode("utf-8")) > 1_024:
             raise InvalidRequestError("idempotency key must be between 1 and 1024 bytes")
-        digest = hashlib.sha256(f"{target}\0{idempotency_key}".encode()).hexdigest()
+        namespace = f"{target}\0{idempotency_key}"
+        if producer_group is not None:
+            namespace = f"{target}\0{producer_group}\0{idempotency_key}"
+        digest = hashlib.sha256(namespace.encode()).hexdigest()
         return f"idem-{digest[:48]}", digest
 
     @staticmethod
@@ -111,10 +133,12 @@ class RelayClient:
             value.pop(field, None)
         return value
 
-    def _load_request(self, target: str, job_id: str) -> RelayRequest | None:
+    def _load_request(
+        self, target: str, job_id: str, producer_group: str | None
+    ) -> RelayRequest | None:
         try:
             ready_data = self.store.get_bytes(
-                self.layout.ready(target, job_id), max_bytes=24 * 1024**2
+                self._ready_key(target, job_id, producer_group), max_bytes=24 * 1024**2
             )
         except ObjectNotFoundError:
             ready = None
@@ -140,6 +164,41 @@ class RelayClient:
         except (ValueError, binascii.Error) as exc:
             raise IntegrityError(f"invalid base64 {description}") from exc
 
+    def _get_bytes_if_present(self, key: str, *, max_bytes: int) -> bytes | None:
+        """Read an immutable object without issuing repeated missing-object GETs."""
+
+        if self.store.head(key) is None:
+            return None
+        try:
+            return self.store.get_bytes(key, max_bytes=max_bytes)
+        except ObjectNotFoundError:
+            # A concurrent cleanup or an eventually consistent compatible store can
+            # make the object disappear between HEAD and GET. Treat that race as a
+            # poll miss instead of failing the job.
+            return None
+
+    def _completed_idempotent_handle(self, request: RelayRequest) -> JobHandle | None:
+        raw = self._get_bytes_if_present(
+            self.layout.done(request.job_id), max_bytes=24 * 1024**2
+        )
+        if raw is None:
+            return None
+        done = DoneMarker.model_validate_json(raw)
+        if done.request_fingerprint is None:
+            return None
+        if done.request_fingerprint != request_fingerprint(request):
+            raise InvalidRequestError(
+                "idempotency key was already used for a different request"
+            )
+        return JobHandle(
+            job_id=request.job_id,
+            target=request.target,
+            producer_group=done.producer_group or request.producer_group,
+            trace_id=done.trace_id or request.trace_id,
+            submitted_at=done.request_created_at or request.created_at,
+            expires_at=done.request_expires_at or request.expires_at,
+        )
+
     def submit(
         self,
         *,
@@ -148,13 +207,21 @@ class RelayClient:
         target: str,
         timeout_seconds: float = 900,
         idempotency_key: str | None = None,
+        producer_group: str | None = None,
         stream: bool | None = None,
         forwarded_headers: dict[str, str] | None = None,
     ) -> JobHandle:
         if timeout_seconds <= 0:
             raise InvalidRequestError("timeout_seconds must be positive")
-        job_id, idempotency_hash = self._job_id(target, idempotency_key)
-        existing = self._load_request(target, job_id) if idempotency_key is not None else None
+        effective_group = self._validate_producer_group(
+            self.producer_group if producer_group is None else producer_group
+        )
+        job_id, idempotency_hash = self._job_id(target, idempotency_key, effective_group)
+        existing = (
+            self._load_request(target, job_id, effective_group)
+            if idempotency_key is not None
+            else None
+        )
         trace_id = f"trace-{uuid.uuid4().hex}"
         now = datetime.now(UTC)
         with tempfile.TemporaryDirectory(prefix=f"gb300-relay-submit-{job_id}-") as raw_directory:
@@ -163,6 +230,7 @@ class RelayClient:
             request = RelayRequest(
                 job_id=job_id,
                 target=target,
+                producer_group=effective_group,
                 endpoint=endpoint,
                 created_at=now,
                 expires_at=now + timedelta(seconds=timeout_seconds),
@@ -179,6 +247,10 @@ class RelayClient:
                         "idempotency key was already used for a different request"
                     )
                 request = existing
+            if idempotency_key is not None:
+                completed_handle = self._completed_idempotent_handle(request)
+                if completed_handle is not None:
+                    return completed_handle
 
             def upload(descriptor) -> None:
                 self.store.upload_file(
@@ -207,7 +279,7 @@ class RelayClient:
                         if_absent=True,
                     )
                 except ConditionalWriteFailed as exc:
-                    winner = self._load_request(target, job_id)
+                    winner = self._load_request(target, job_id, effective_group)
                     if winner is None or self._equivalence_payload(
                         winner
                     ) != self._equivalence_payload(request):
@@ -220,6 +292,7 @@ class RelayClient:
             ready = ReadyMarker(
                 job_id=request.job_id,
                 target=request.target,
+                producer_group=request.producer_group,
                 manifest_sha256=sha256_bytes(manifest_data),
                 manifest_base64=(
                     base64.b64encode(manifest_data).decode("ascii") if inline_manifest else None
@@ -228,19 +301,28 @@ class RelayClient:
             )
             try:
                 self.store.put_bytes(
-                    self.layout.ready(target, job_id),
+                    self._ready_key(target, job_id, effective_group),
                     canonical_json_bytes(ready.model_dump(mode="json", exclude_defaults=True)),
                     content_type="application/json",
                     if_absent=True,
                 )
             except ConditionalWriteFailed as exc:
-                current = ReadyMarker.model_validate_json(
-                    self.store.get_bytes(
-                        self.layout.ready(target, job_id), max_bytes=24 * 1024**2
+                try:
+                    current = ReadyMarker.model_validate_json(
+                        self.store.get_bytes(
+                            self._ready_key(target, job_id, effective_group),
+                            max_bytes=24 * 1024**2,
+                        )
                     )
-                )
+                except ObjectNotFoundError:
+                    completed_handle = self._completed_idempotent_handle(request)
+                    if completed_handle is not None:
+                        return completed_handle
+                    raise IntegrityError(
+                        "READY marker disappeared during conditional submission"
+                    ) from exc
                 if current.manifest_sha256 != ready.manifest_sha256:
-                    winner = self._load_request(target, job_id)
+                    winner = self._load_request(target, job_id, effective_group)
                     if (
                         winner is None
                         or idempotency_key is None
@@ -251,9 +333,17 @@ class RelayClient:
                             "READY marker does not match the request manifest"
                         ) from exc
                     request = winner
+            if idempotency_key is not None and effective_group is not None:
+                completed_handle = self._completed_idempotent_handle(request)
+                if completed_handle is not None:
+                    self.store.delete_keys(
+                        (self._ready_key(target, job_id, effective_group),)
+                    )
+                    return completed_handle
             return JobHandle(
                 job_id=request.job_id,
                 target=request.target,
+                producer_group=request.producer_group,
                 trace_id=request.trace_id,
                 submitted_at=request.created_at,
                 expires_at=request.expires_at,
@@ -320,6 +410,7 @@ class RelayClient:
     ) -> CompletedJob:
         job_id = handle.job_id if isinstance(handle, JobHandle) else handle
         target = handle.target if isinstance(handle, JobHandle) else None
+        producer_group = handle.producer_group if isinstance(handle, JobHandle) else None
         deadline = time.monotonic() + (
             timeout_seconds
             if timeout_seconds is not None
@@ -328,15 +419,14 @@ class RelayClient:
             else 900.0
         )
         while True:
-            try:
-                done_data = self.store.get_bytes(
-                    self.layout.done(job_id), max_bytes=24 * 1024**2
-                )
+            done_data = self._get_bytes_if_present(
+                self.layout.done(job_id), max_bytes=24 * 1024**2
+            )
+            if done_data is not None:
                 break
-            except ObjectNotFoundError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for relay job {job_id}") from None
-                time.sleep(self.poll_interval_seconds)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for relay job {job_id}")
+            time.sleep(self.poll_interval_seconds)
         with tempfile.TemporaryDirectory(prefix=f"gb300-relay-result-{job_id}-") as directory:
             completed = self._read_completed(job_id, Path(directory), done_data=done_data)
         if target is None:
@@ -344,7 +434,7 @@ class RelayClient:
         if acknowledge:
             self.acknowledge(job_id)
         if cleanup:
-            self.cleanup(target=target, job_id=job_id)
+            self.cleanup(target=target, job_id=job_id, producer_group=producer_group)
         if raise_on_failure and completed.metadata.status != JobStatus.SUCCEEDED:
             raise JobFailedError(completed.metadata, completed.body)
         return completed
@@ -369,13 +459,10 @@ class RelayClient:
         while True:
             if done is None:
                 done_key = self.layout.done(handle.job_id)
-                try:
-                    raw = await asyncio.to_thread(
-                        self.store.get_bytes, done_key, max_bytes=24 * 1024**2
-                    )
-                except ObjectNotFoundError:
-                    pass
-                else:
+                raw = await asyncio.to_thread(
+                    self._get_bytes_if_present, done_key, max_bytes=24 * 1024**2
+                )
+                if raw is not None:
                     done = DoneMarker.model_validate_json(raw)
             objects = await asyncio.to_thread(
                 self.store.list, self.layout.stream_prefix(handle.job_id)
@@ -406,7 +493,10 @@ class RelayClient:
                     await asyncio.to_thread(self.acknowledge, handle.job_id)
                     if cleanup and done.status == JobStatus.SUCCEEDED:
                         await asyncio.to_thread(
-                            self.cleanup, target=handle.target, job_id=handle.job_id
+                            self.cleanup,
+                            target=handle.target,
+                            job_id=handle.job_id,
+                            producer_group=handle.producer_group,
                         )
                     for data in held_terminal_chunks:
                         yield data
@@ -446,11 +536,18 @@ class RelayClient:
         except ConditionalWriteFailed:
             return
 
-    def cleanup(self, *, target: str, job_id: str) -> int:
+    def cleanup(
+        self, *, target: str, job_id: str, producer_group: str | None = None
+    ) -> int:
+        effective_group = self.producer_group if producer_group is None else producer_group
         prefixes = self.layout.job_cleanup_prefixes(target, job_id)
         with ThreadPoolExecutor(max_workers=len(prefixes)) as executor:
             groups = list(executor.map(self.store.list, prefixes))
         keys = [item.key for group in groups for item in group]
+        if effective_group is not None:
+            grouped_ready = self.layout.grouped_ready(target, effective_group, job_id)
+            if self.store.head(grouped_ready) is not None:
+                keys.append(grouped_ready)
         self.store.delete_keys(keys)
         self.store.delete_keys(
             (
@@ -469,6 +566,7 @@ def client_from_gateway_config(
         store,
         prefix=prefix,
         client_id=config.client_id,
+        producer_group=config.producer_group,
         media_policy=config.media,
         poll_interval_seconds=config.poll_interval_seconds,
         compact_protocol=config.compact_protocol,

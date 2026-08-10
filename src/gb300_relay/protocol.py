@@ -79,6 +79,7 @@ class RelayRequest(StrictModel):
     schema_version: Literal["1.0"] = SCHEMA_VERSION
     job_id: str = Field(pattern=SAFE_ID_PATTERN)
     target: str = Field(pattern=SAFE_ID_PATTERN)
+    producer_group: str | None = Field(default=None, pattern=SAFE_ID_PATTERN)
     endpoint: str = Field(pattern=r"^/v1/[A-Za-z0-9_./-]{1,200}$")
     method: Literal["POST"] = "POST"
     created_at: datetime = Field(default_factory=utc_now)
@@ -108,10 +109,20 @@ class RelayRequest(StrictModel):
         return sha256_bytes(canonical_json_bytes(self.model_dump(mode="json")))
 
 
+def request_fingerprint(request: RelayRequest) -> str:
+    """Hash the logical request while excluding per-attempt timestamps and trace IDs."""
+
+    value = request.model_dump(mode="json")
+    for field in ("created_at", "expires_at", "trace_id"):
+        value.pop(field, None)
+    return sha256_bytes(canonical_json_bytes(value))
+
+
 class ReadyMarker(StrictModel):
     schema_version: Literal["1.0"] = SCHEMA_VERSION
     job_id: str = Field(pattern=SAFE_ID_PATTERN)
     target: str = Field(pattern=SAFE_ID_PATTERN)
+    producer_group: str | None = Field(default=None, pattern=SAFE_ID_PATTERN)
     manifest_sha256: str = Field(pattern=SHA256_PATTERN)
     manifest_base64: str | None = Field(default=None, max_length=24 * 1024**2)
     compact_response: bool = False
@@ -156,6 +167,7 @@ class RelayResponse(StrictModel):
     schema_version: Literal["1.0"] = SCHEMA_VERSION
     job_id: str = Field(pattern=SAFE_ID_PATTERN)
     target: str = Field(pattern=SAFE_ID_PATTERN)
+    producer_group: str | None = Field(default=None, pattern=SAFE_ID_PATTERN)
     worker_id: str = Field(pattern=SAFE_ID_PATTERN)
     status: JobStatus
     created_at: datetime
@@ -188,6 +200,11 @@ class DoneMarker(StrictModel):
     status: JobStatus
     response_sha256: str = Field(pattern=SHA256_PATTERN)
     response: RelayResponse | None = None
+    producer_group: str | None = Field(default=None, pattern=SAFE_ID_PATTERN)
+    request_fingerprint: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    request_created_at: datetime | None = None
+    request_expires_at: datetime | None = None
+    trace_id: str | None = Field(default=None, pattern=SAFE_ID_PATTERN)
     completed_at: datetime = Field(default_factory=utc_now)
     stream_chunk_count: int | None = Field(default=None, ge=0)
 
@@ -214,6 +231,7 @@ class WorkerHeartbeat(StrictModel):
 class JobHandle(StrictModel):
     job_id: str = Field(pattern=SAFE_ID_PATTERN)
     target: str = Field(pattern=SAFE_ID_PATTERN)
+    producer_group: str | None = Field(default=None, pattern=SAFE_ID_PATTERN)
     trace_id: str = Field(pattern=SAFE_ID_PATTERN)
     submitted_at: datetime
     expires_at: datetime

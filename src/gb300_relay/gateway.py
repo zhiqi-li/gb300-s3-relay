@@ -192,11 +192,17 @@ def create_app(
             f"gateway authentication variable is unset: {config.auth_token_env}"
         )
 
-    def finalize_job(target: str, job_id: str, cleanup: bool) -> None:
+    def finalize_job(
+        target: str, job_id: str, producer_group: str | None, cleanup: bool
+    ) -> None:
         try:
             relay_client.acknowledge(job_id)
             if cleanup:
-                relay_client.cleanup(target=target, job_id=job_id)
+                relay_client.cleanup(
+                    target=target,
+                    job_id=job_id,
+                    producer_group=producer_group,
+                )
         except Exception:
             log_event(
                 LOGGER,
@@ -311,6 +317,11 @@ def create_app(
                 status_code=400,
             )
         requested_target = request.headers.get("x-gb300-target")
+        producer_group = (
+            request.headers.get("x-gb300-producer-group")
+            if config.allow_producer_group_header
+            else None
+        ) or config.producer_group
         model = body.get("model") if isinstance(body.get("model"), str) else None
         try:
             target = await asyncio.to_thread(
@@ -328,6 +339,7 @@ def create_app(
                 target=target,
                 timeout_seconds=timeout,
                 idempotency_key=request.headers.get("idempotency-key"),
+                producer_group=producer_group,
                 stream=bool(body.get("stream", False)),
                 forwarded_headers=forwarded,
             )
@@ -349,6 +361,7 @@ def create_app(
         common_headers = {
             "x-relay-job-id": handle.job_id,
             "x-relay-target": target,
+            "x-relay-producer-group": handle.producer_group or "legacy",
             "x-request-id": handle.trace_id,
         }
         if body.get("stream"):
@@ -438,7 +451,13 @@ def create_app(
             status_code=completed.metadata.http_status,
             media_type=completed.metadata.content_type.split(";", 1)[0],
             headers=response_headers,
-            background=BackgroundTask(finalize_job, target, handle.job_id, cleanup_job),
+            background=BackgroundTask(
+                finalize_job,
+                target,
+                handle.job_id,
+                handle.producer_group,
+                cleanup_job,
+            ),
         )
 
     return app

@@ -42,6 +42,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(layout.parse_ready_key(key, "gb300-1"), "job-123")
         self.assertIsNone(layout.parse_ready_key(key, "gb300-2"))
 
+    def test_layout_round_trip_for_grouped_ready_key(self) -> None:
+        layout = ObjectLayout("relay/v1")
+        key = layout.grouped_ready("gb300-1", "osmo-node-17", "job-123")
+        self.assertEqual(
+            key,
+            "relay/v1/queue/gb300-1/osmo-node-17/job-123.json",
+        )
+        self.assertEqual(
+            layout.parse_grouped_ready_key(key, "gb300-1"),
+            ("osmo-node-17", "job-123"),
+        )
+        self.assertIsNone(layout.parse_grouped_ready_key(key, "gb300-2"))
+
 
 if __name__ == "__main__":
     unittest.main()

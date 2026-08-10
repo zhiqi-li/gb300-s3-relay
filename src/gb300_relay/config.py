@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import tomllib
 from pathlib import Path
@@ -9,6 +10,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .errors import ConfigurationError
+
+
+def _default_producer_group() -> str:
+    """Return a stable, path-safe identifier for the gateway hardware node."""
+
+    hostname = re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname()).strip("._-")
+    return f"osmo-{hostname or 'unknown'}"[:128].rstrip("._-")
 
 
 class ConfigModel(BaseModel):
@@ -83,6 +91,11 @@ class GatewayConfig(ConfigModel):
     max_json_body_bytes: int = Field(default=1024**3, ge=1, le=16 * 1024**3)
     auth_token_env: str | None = None
     client_id: str = Field(default_factory=lambda: f"gateway-{socket.gethostname()}-{os.getpid()}")
+    producer_group: str = Field(
+        default_factory=_default_producer_group,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    allow_producer_group_header: bool = True
     allowed_endpoints: tuple[str, ...] = (
         "/v1/chat/completions",
         "/v1/responses",
@@ -106,12 +119,21 @@ class WorkerConfig(ConfigModel):
     upstream_base_url: str = "http://127.0.0.1:8000"
     upstream_api_key_env: str | None = "GB300_UPSTREAM_API_KEY"
     max_concurrency: int = Field(default=8, ge=1, le=1_024)
+    max_concurrency_per_producer: int | None = Field(default=None, ge=1, le=1_024)
     max_heavy_concurrency: int = Field(default=8, ge=1, le=1_024)
     heavy_request_threshold_bytes: int = Field(default=128 * 1024, ge=1, le=1024**3)
     thread_pool_workers: int = Field(default=128, ge=4, le=1_024)
-    asset_transfer_concurrency: int = Field(default=8, ge=1, le=128)
+    asset_transfer_concurrency: int = Field(default=16, ge=1, le=128)
+    asset_transfer_scope: Literal["worker", "request"] = "worker"
+    asset_fairness_quantum_bytes: int = Field(
+        default=16 * 1024**2,
+        ge=1024**2,
+        le=1024**3,
+    )
     poll_interval_seconds: float = Field(default=0.5, gt=0, le=60)
     poll_jitter_seconds: float = Field(default=0.25, ge=0, le=60)
+    scan_legacy_ready: bool = True
+    terminal_cache_size: int = Field(default=100_000, ge=0, le=10_000_000)
     lease_seconds: int = Field(default=1_800, ge=30, le=86_400)
     lease_heartbeat_seconds: int = Field(default=60, ge=5, le=3_600)
     worker_heartbeat_seconds: int = Field(default=10, ge=1, le=600)

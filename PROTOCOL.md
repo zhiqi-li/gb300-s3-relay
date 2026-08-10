@@ -5,7 +5,8 @@ Every key is relative to the configured `<prefix>`.
 ```text
 requests/<target>/<job>/assets/*
 requests/<target>/<job>/manifest.json
-requests/<target>/<job>/READY.json
+queue/<target>/<producer-group>/<job>.json
+requests/<target>/<job>/READY.json              # legacy compatibility
 claims/<target>/<job>/<generation>/claim.json
 claims/<target>/<job>/<generation>/heartbeats/*.json
 streams/<job>/<sequence>.sse
@@ -20,11 +21,11 @@ workers/<target>/<worker>.json
 
 ## Visibility and commit markers
 
-A worker consumes only a request with a valid `READY.json`. A client consumes only a response with a valid `DONE.json`. Each marker contains the SHA-256 digest of the committed metadata, so visibility of a valid marker represents a complete and verifiable stage commit.
+A worker consumes only a request with a valid grouped queue marker (or a legacy `READY.json` while compatibility scanning is enabled). A client consumes only a response with a valid `DONE.json`. Each marker contains the SHA-256 digest of the committed metadata, so visibility of a valid marker represents a complete and verifiable stage commit.
 
-The client uploads assets before the manifest and creates `READY.json` last. The worker uploads the response body and any stream chunks before response metadata and creates `DONE.json` last.
+The client uploads assets before the manifest and creates the grouped queue marker last. The worker uploads the response body and any stream chunks before response metadata and creates `DONE.json` last. It can then remove the grouped marker because `DONE.json` retains the producer group, logical request fingerprint, request timestamps, and trace ID needed for safe idempotent retries.
 
-When the client opts into the compact protocol, `READY.json.manifest_base64` carries a small
+When the client opts into the compact protocol, the queue marker's `manifest_base64` carries a small
 canonical request manifest and the separate `manifest.json` object is omitted. When that marker
 also requests a compact response and the body fits the worker threshold,
 `DONE.json.response.body_base64` carries the body and the separate response body and

@@ -22,6 +22,8 @@ Do not require direct OSMO-to-GB300 TCP connectivity. Do not expose the GB300 mo
 6. Desired worker concurrency, job deadline, lease duration, and retention policy.
 7. For `auto` or `file_uri` media delivery, a filesystem namespace and permissions that let
    the local model-server account read the worker's temporary files.
+8. One stable producer-group ID per OSMO hardware node, or a trusted caller that sends
+   `x-gb300-producer-group` on every request.
 
 Never put credential values into TOML, command arguments, source control, logs, or generated reports. Configurations reference credential files and environment-variable names only.
 
@@ -36,12 +38,15 @@ Never put credential values into TOML, command arguments, source control, logs, 
    - `s5cmd_round_trip=ok`
    - a nonzero cleanup count for the probe objects
 5. Start every worker.
-6. Enable `gateway.compact_protocol` only after every target runs the matching worker version.
+6. Enable `gateway.compact_protocol` and producer-grouped submission only after every target
+   runs the matching worker version. Keep `worker.scan_legacy_ready=true` during this rollout.
 7. Wait for `/readyz` on the gateway to report at least one healthy worker for each required target.
 8. Start or expose the gateway only on the intended interface. Configure `auth_token_env` before any non-loopback bind.
 9. Set `OPENAI_BASE_URL=http://<gateway>/v1` and a nonempty `OPENAI_API_KEY` in the application.
 10. Perform one forced-target request per worker, one load-balanced request, and one streaming request.
 11. If multimodal inference is required, test an actual image and video accepted by the deployed model, not only transport fixtures.
+12. After legacy `READY.json` jobs drain, set `worker.scan_legacy_ready=false` to avoid the
+    compatibility LIST on every poll.
 
 ## Readiness gates
 
@@ -77,6 +82,7 @@ Per-call controls belong in OpenAI `extra_headers`:
 ```python
 extra_headers = {
     "x-gb300-target": "gb300-1",
+    "x-gb300-producer-group": "osmo-node-17",
     "x-relay-timeout-seconds": "1800",
     "idempotency-key": "stable-logical-operation-id",
 }

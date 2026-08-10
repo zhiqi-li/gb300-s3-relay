@@ -153,6 +153,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.json()["choices"][0]["message"]["content"], "relay-ok")
         self.assertEqual(second.status_code, 200)
         self.assertEqual(first.headers["x-relay-job-id"], second.headers["x-relay-job-id"])
+        self.assertEqual(first.headers["x-relay-producer-group"], self.config.producer_group)
         self.assertEqual(upstream.calls, 1)
         self.assertTrue(self.store.list("relay/v1/results/"))
 
@@ -176,6 +177,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 response_task = asyncio.create_task(
                     http.post(
                         "/v1/chat/completions",
+                        headers={"x-gb300-producer-group": "osmo-node-9"},
                         json={"model": "vlm", "messages": []},
                     )
                 )
@@ -183,13 +185,26 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 response = await response_task
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-relay-producer-group"], "osmo-node-9")
         self.assertFalse(self.store.list("relay/v1/requests/"))
+        self.assertFalse(self.store.list("relay/v1/queue/"))
         self.assertFalse(self.store.list("relay/v1/results/"))
 
     async def test_rejects_non_object_json(self) -> None:
         transport = httpx.ASGITransport(app=self.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://relay") as http:
             response = await http.post("/v1/chat/completions", json=["not", "an", "object"])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+
+    async def test_rejects_unsafe_producer_group(self) -> None:
+        transport = httpx.ASGITransport(app=self.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://relay") as http:
+            response = await http.post(
+                "/v1/chat/completions",
+                headers={"x-gb300-producer-group": "../another-node"},
+                json={"model": "vlm", "messages": []},
+            )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
 

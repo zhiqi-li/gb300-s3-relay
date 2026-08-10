@@ -39,7 +39,7 @@ class GarbageCollector:
         self, *, apply: bool = False, now: datetime | None = None
     ) -> GarbageCollectionReport:
         now = now or datetime.now(UTC)
-        candidates: list[tuple[str, str]] = []
+        candidates: list[tuple[str, str, str | None]] = []
         errors: list[str] = []
         for item in self.store.list(self.layout.results_prefix()):
             job_id = self.layout.parse_done_key(item.key)
@@ -73,14 +73,18 @@ class GarbageCollector:
                 and self.store.head(self.layout.ack(job_id)) is None
             ):
                 continue
-            candidates.append((metadata.target, job_id))
+            candidates.append((metadata.target, job_id, metadata.producer_group))
 
         removed_jobs = 0
         removed_objects = 0
         if apply:
-            for target, job_id in candidates:
+            for target, job_id, producer_group in candidates:
                 try:
-                    removed_objects += self.client.cleanup(target=target, job_id=job_id)
+                    removed_objects += self.client.cleanup(
+                        target=target,
+                        job_id=job_id,
+                        producer_group=producer_group,
+                    )
                     removed_jobs += 1
                 except Exception as exc:
                     errors.append(f"{job_id}: {exc}")

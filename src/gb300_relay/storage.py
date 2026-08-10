@@ -115,6 +115,12 @@ class S3ObjectStore:
                 max_pool_connections=config.max_pool_connections,
             ),
         )
+        put_object_input = self._client.meta.service_model.operation_model(
+            "PutObject"
+        ).input_shape
+        self._native_conditional_put = bool(
+            put_object_input and "IfNoneMatch" in put_object_input.members
+        )
         self._http = httpx.Client(
             timeout=httpx.Timeout(
                 config.operation_timeout_seconds,
@@ -143,7 +149,39 @@ class S3ObjectStore:
     def _path_style_url(self, key: str) -> str:
         return f"{self.config.endpoint_url}/{quote(self.bucket, safe='')}/{quote(key, safe='/~')}"
 
-    def _conditional_put(self, key: str, data: bytes, content_type: str) -> ObjectInfo:
+    def _conditional_put_native(
+        self, key: str, data: bytes, content_type: str
+    ) -> ObjectInfo:
+        try:
+            response = self._client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            error = exc.response.get("Error", {})
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status in {409, 412} or error.get("Code") in {
+                "ConditionalRequestConflict",
+                "PreconditionFailed",
+            }:
+                raise ConditionalWriteFailed(
+                    f"object already exists: s3://{self.bucket}/{key}"
+                ) from exc
+            raise StorageError(
+                f"conditional PUT failed for s3://{self.bucket}/{key}: {exc}"
+            ) from exc
+        except BotoCoreError as exc:
+            raise StorageError(
+                f"conditional PUT failed for s3://{self.bucket}/{key}: {exc}"
+            ) from exc
+        return ObjectInfo(key=key, size=len(data), etag=response.get("ETag"))
+
+    def _conditional_put_http(
+        self, key: str, data: bytes, content_type: str
+    ) -> ObjectInfo:
         url = self._path_style_url(key)
         request = AWSRequest(
             method="PUT",
@@ -172,6 +210,11 @@ class S3ObjectStore:
                 f"HTTP {response.status_code} {message}"
             )
         return ObjectInfo(key=key, size=len(data), etag=response.headers.get("etag"))
+
+    def _conditional_put(self, key: str, data: bytes, content_type: str) -> ObjectInfo:
+        if getattr(self, "_native_conditional_put", False):
+            return self._conditional_put_native(key, data, content_type)
+        return self._conditional_put_http(key, data, content_type)
 
     def put_bytes(
         self,

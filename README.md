@@ -37,8 +37,20 @@ Worker admission has two limits. `max_concurrency` controls all in-flight jobs, 
 `max_heavy_concurrency` separately bounds requests that contain assets or whose serialized body
 exceeds `heavy_request_threshold_bytes`. This permits high short-text concurrency without
 allowing a burst of long-context or multimodal requests to exhaust KV cache.
+Asset download and SHA-256 work happens inside that heavy-request bound. By default,
+`asset_transfer_concurrency` is also one worker-wide limit rather than a fresh limit for every
+request. Waiting transfers are admitted across `producer_group` hardware groups using their file
+sizes and `asset_fairness_quantum_bytes`, so a producer sending large videos cannot indefinitely
+hold back another producer's small images. `asset_transfer_scope = "request"` retains the old
+per-request behavior for rollback and A/B testing, but its effective host concurrency can grow to
+`max_heavy_concurrency * asset_transfer_concurrency`.
+For the common one-image-plus-one-video shape, a useful starting point is
+`asset_transfer_concurrency = 2 * max_heavy_concurrency` (the supplied worker templates use
+16 and 8 respectively). Lower the global value only when object-store or local disk telemetry
+shows saturation.
 `thread_pool_workers` sizes the blocking object-store I/O executor independently of model
-admission; keep it at least as large as `max_concurrency` for bursty workloads.
+admission; keep it at least as large as both `max_concurrency` and
+`asset_transfer_concurrency` for bursty workloads.
 
 ## Quick start
 
@@ -88,6 +100,42 @@ export OPENAI_API_KEY=relay-local
 python existing_app.py
 ```
 
+### Local SDK demo
+
+With the persistent GB300 workers already running, start one gateway on the local or OSMO
+machine. The configuration file must point at the same S3 bucket and prefix as the workers:
+
+```bash
+# Terminal 1
+.venv/bin/gb300-relay gateway --config /secure/path/osmo-gateway.toml
+```
+
+Run the self-contained demo from another terminal. It uses the official OpenAI Python SDK and
+prints the model response plus the selected relay target and job ID:
+
+```bash
+# Terminal 2
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=relay-local
+
+.venv/bin/python examples/local_demo.py --model your-model
+```
+
+Omit `--target` to load-balance across healthy workers, or force one GB300 host and enable
+streaming:
+
+```bash
+.venv/bin/python examples/local_demo.py \
+  --model your-model \
+  --target gb300-1 \
+  --stream
+```
+
+If each worker advertises its supported model IDs through `worker.models`, `--model` can be
+omitted. Run `examples/local_demo.py --help` for prompt, timeout, idempotency, and Qwen thinking
+options. The API key above is only a local placeholder unless gateway authentication is enabled;
+when `gateway.auth_token_env` is configured, set `OPENAI_API_KEY` to the matching token.
+
 Or use the package factory explicitly:
 
 ```python
@@ -113,6 +161,7 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello"}],
     extra_headers={
         "x-gb300-target": "gb300-2",
+        "x-gb300-producer-group": "osmo-node-17",
         "x-relay-timeout-seconds": "1800",
         "idempotency-key": "dataset-row-000042",
     },
@@ -120,9 +169,16 @@ response = client.chat.completions.create(
 ```
 
 - `x-gb300-target` pins a call to one configured target. Without it, the gateway load-balances across healthy workers.
+- `x-gb300-producer-group` identifies the OSMO hardware node. The gateway's stable `producer_group` is used when the header is omitted.
 - `x-relay-timeout-seconds` sets the end-to-end deadline.
-- `idempotency-key` executes an identical request once within its retention window. Reusing the key for a different request is rejected.
-- Responses include `x-relay-job-id`, `x-relay-target`, and `x-request-id` headers.
+- `idempotency-key` executes an identical request once within its retention window. Its namespace includes the producer group, so different hardware nodes may reuse the same row ID safely.
+- Responses include `x-relay-job-id`, `x-relay-target`, `x-relay-producer-group`, and `x-request-id` headers.
+
+Grouped requests use shallow queue objects at `queue/<target>/<producer-group>/<job-id>.json`.
+The worker round-robins non-empty groups before borrowing unused capacity, and
+`max_concurrency_per_producer` can add a hard per-group ceiling. Completed grouped queue markers
+are removed after `DONE.json` is committed; the terminal request fingerprint preserves
+idempotency checks without leaving the active queue to grow indefinitely.
 
 ## Images and video
 
@@ -166,7 +222,7 @@ For large videos, enable `file://` inputs only for explicit roots using `allow_f
 
 ## Lifecycle and delivery guarantees
 
-In the standard path, submission order is assets, `manifest.json`, then `READY.json`, and completion order is response body or stream chunks, `response.json`, then `DONE.json`. In the compact path, the manifest is embedded in `READY.json` and a small response is embedded in `DONE.json`; those immutable objects remain the respective commit points. Contended writes use `If-None-Match: *`, and requests, assets, and responses carry size and SHA-256 metadata.
+In the standard path, submission order is assets, `manifest.json`, then the grouped queue marker, and completion order is response body or stream chunks, `response.json`, then `DONE.json`. In the compact path, the manifest is embedded in the grouped queue marker and a small response is embedded in `DONE.json`; those immutable objects remain the respective commit points. Legacy `requests/<target>/<job-id>/READY.json` jobs remain readable while `worker.scan_legacy_ready` is enabled. Contended writes use `If-None-Match: *`, and requests, assets, and responses carry size and SHA-256 metadata.
 
 - During a live lease, only one worker calls the model for a job.
 - A new immutable lease generation can take over after worker failure. Execution across lease expiry is therefore **at least once**, not exactly once. Use stable idempotency keys for costly calls and avoid non-idempotent upstream side effects.
@@ -226,6 +282,8 @@ that defaults to reasoning mode, add `--disable-thinking` to exercise visible re
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/ruff check .
 .venv/bin/python -m build
+.venv/bin/python scripts/benchmark-grouped-queue.py \
+  --config config/gb300-1.toml --host-label gb300-1 --rounds 2
 ```
 
 No AWS credentials, model API keys, SSH addresses, or deployment-specific secrets belong in this repository or its logs.

@@ -41,6 +41,20 @@ class ObjectLayout:
     def ready(self, target: str, job_id: str) -> str:
         return f"{self.request_prefix(target, job_id)}/READY.json"
 
+    def grouped_ready(self, target: str, producer_group: str, job_id: str) -> str:
+        """A shallow, producer-partitioned request commit marker."""
+
+        return (
+            f"{self.grouped_ready_prefix(target, producer_group)}"
+            f"{_segment(job_id, 'job_id')}.json"
+        )
+
+    def grouped_ready_prefix(self, target: str, producer_group: str | None = None) -> str:
+        prefix = f"{self.prefix}/queue/{_segment(target, 'target')}/"
+        if producer_group is None:
+            return prefix
+        return f"{prefix}{_segment(producer_group, 'producer_group')}/"
+
     def target_ready_prefix(self, target: str) -> str:
         return f"{self.prefix}/requests/{_segment(target, 'target')}/"
 
@@ -133,6 +147,16 @@ class ObjectLayout:
         if "/" in middle or not _SAFE_SEGMENT.fullmatch(middle):
             return None
         return middle
+
+    def parse_grouped_ready_key(self, key: str, target: str) -> tuple[str, str] | None:
+        prefix = self.grouped_ready_prefix(target)
+        if not key.startswith(prefix) or not key.endswith(".json"):
+            return None
+        tail = key[len(prefix) : -len(".json")]
+        parts = tail.split("/")
+        if len(parts) != 2 or any(not _SAFE_SEGMENT.fullmatch(part) for part in parts):
+            return None
+        return parts[0], parts[1]
 
     def parse_claim_generation(self, key: str, target: str, job_id: str) -> int | None:
         prefix = self.claim_job_prefix(target, job_id)

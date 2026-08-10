@@ -93,7 +93,15 @@ multimodal deployments, set:
 ```toml
 [worker]
 media_delivery = "data_uri"
+# One worker-wide pool; 16 preserves parallelism for eight image+video requests.
+asset_transfer_scope = "worker"
+asset_transfer_concurrency = 16
+asset_fairness_quantum_bytes = 16777216
 ```
+
+The worker admits asset transfers across producer hardware groups with byte-weighted fairness.
+Keep `asset_transfer_scope = "request"` only as a rolling-back/A-B compatibility switch; under
+that legacy mode, every multimodal request receives a separate transfer allowance.
 
 ## Validate and start
 
@@ -110,6 +118,11 @@ count. Then install the unit and enable the target instance:
 For upgrades that introduce compact protocol support, roll and validate every worker before
 enabling `gateway.compact_protocol`. New workers accept both the standard and compact formats;
 an older worker cannot read a compact `READY.json`.
+
+Producer-grouped queues use the same worker-first rollout. Keep `worker.scan_legacy_ready=true`
+while upgrading workers, then upgrade the gateway so it publishes
+`queue/<target>/<producer-group>/<job>.json`. After old `READY.json` jobs have drained, set
+`scan_legacy_ready=false` and roll the workers once more to remove the extra legacy LIST.
 
 ```bash
 sudo install -m 0644 /opt/gb300-s3-relay/systemd/gb300-relay-worker@.service \

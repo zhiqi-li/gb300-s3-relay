@@ -1,0 +1,95 @@
+version: 1
+
+fleet:
+  name: gb300-production
+  deployment_parallelism: 2
+  default_stages: [system, model, relay]
+
+ssh_defaults:
+  port: 22
+  connect_timeout_seconds: 20
+
+runtime:
+  driver_package: nvidia-driver-595-open
+  docker_package: docker.io
+  nvidia_container_toolkit_version: 1.20.0-1
+
+model:
+  id: Qwen/Qwen3.8-27B-FP8
+  revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+  image: vllm/vllm-openai@sha256:4a2f33a884222f7049b983263ad9976f89452bb81affecf5b67d89ad35c1bc31
+  service_name: gb300-qwen38-fp8
+  container_name: gb300-qwen38-fp8
+  listen_host: 127.0.0.1
+  port: 8000
+  cache_dir: /var/lib/gb300-models/huggingface
+  start_timeout_seconds: 3600
+  tensor_parallel_size: 1
+  max_model_len: 262144
+  gpu_memory_utilization: 0.92
+  kv_cache_dtype: fp8
+  mtp_tokens: 3
+  reasoning_parser: qwen3
+  tool_call_parser: qwen3_coder
+  multimodal:
+    encoder_tp_mode: data
+    encoder_attention_backend: FLASHINFER
+    encoder_attention_dtype: fp8
+    processor_cache_gb: 8
+    processor_cache_type: shm
+    shm_cache_max_object_size_mb: 512
+    max_images_per_prompt: 8
+    max_videos_per_prompt: 2
+
+relay:
+  enabled: true
+  s3:
+    bucket: your-gb300-relay-bucket
+    prefix: gb300-relay/v1
+    endpoint_url: https://object-store.example.com
+    region: us-east-1
+    addressing_style: path
+    verify_tls: true
+    credentials_file: ~/.aws/credentials
+    profile: gb300-relay-source
+    remote_profile: gb300-relay
+    retry_count: 10
+    max_pool_connections: 256
+    native_transfer_max_bytes: 8388608
+  worker:
+    max_concurrency: 64
+    max_heavy_concurrency: 8
+    thread_pool_workers: 128
+    asset_transfer_concurrency: 16
+    poll_interval_seconds: 0.05
+    poll_jitter_seconds: 0.05
+    heartbeat_seconds: 2
+    job_timeout_seconds: 900
+    media_delivery: data_uri
+    stream_flush_interval_seconds: 0.1
+    metrics_port: 9108
+  gateway:
+    host: 127.0.0.1
+    port: 18080
+    producer_group: gb300-fleet-gateway
+    poll_interval_seconds: 0.05
+    heartbeat_ttl_seconds: 15
+    default_timeout_seconds: 900
+    max_timeout_seconds: 1800
+    thread_pool_workers: 256
+
+nodes:
+  - id: gb300-0001
+    host: gb300-0001.example.com
+    ssh:
+      user: relay-admin
+      password_env: GB300_0001_SSH_PASSWORD
+      # Pin the value printed by: ssh-keygen -lf <(ssh-keyscan HOST) -E sha256
+      host_key_sha256: SHA256:replace-with-pinned-host-key
+
+  - id: gb300-0002
+    host: gb300-0002.example.com
+    ssh:
+      user: relay-admin
+      password_env: GB300_0002_SSH_PASSWORD
+      host_key_sha256: SHA256:replace-with-pinned-host-key

@@ -62,6 +62,10 @@ class TargetSelector:
         self._cache: dict[str, list[WorkerHeartbeat]] = {}
         self._refreshing = False
         self._round_robin = 0
+        # Heartbeats are intentionally cached, so a burst can arrive before a worker has
+        # published its new inflight count. Track this gateway's outstanding assignments to
+        # keep burst routing balanced during that visibility gap.
+        self._local_inflight: dict[str, int] = {target: 0 for target in config.targets}
 
     def _fetch_workers(self) -> dict[str, list[WorkerHeartbeat]]:
         grouped: dict[str, list[WorkerHeartbeat]] = {
@@ -124,28 +128,39 @@ class TargetSelector:
             raise InvalidRequestError(f"unknown relay target: {requested}")
         workers = self._workers()
         candidates = (requested,) if requested else self.config.targets
-        scored: list[tuple[float, int, str]] = []
         with self._lock:
             rr = self._round_robin
             self._round_robin += 1
-        for index, target in enumerate(candidates):
-            healthy = [
-                item
-                for item in workers.get(target, ())
-                if not model or not item.models or model in item.models
-            ]
-            if not healthy:
-                if self.config.require_healthy_worker:
+            scored: list[tuple[float, int, str]] = []
+            for index, target in enumerate(candidates):
+                healthy = [
+                    item
+                    for item in workers.get(target, ())
+                    if not model or not item.models or model in item.models
+                ]
+                if not healthy:
+                    if self.config.require_healthy_worker:
+                        continue
+                    scored.append((1.0, (index - rr) % max(1, len(candidates)), target))
                     continue
-                scored.append((1.0, (index - rr) % max(1, len(candidates)), target))
-                continue
-            capacity = sum(item.max_concurrency for item in healthy)
-            inflight = sum(item.inflight for item in healthy)
-            utilization = inflight / capacity if capacity else 1.0
-            scored.append((utilization, (index - rr) % max(1, len(candidates)), target))
-        if not scored:
-            raise NoHealthyWorkerError("no healthy GB300 worker is available")
-        return min(scored)[2]
+                capacity = sum(item.max_concurrency for item in healthy)
+                inflight = sum(item.inflight for item in healthy)
+                inflight += self._local_inflight.get(target, 0)
+                utilization = inflight / capacity if capacity else 1.0
+                scored.append((utilization, (index - rr) % max(1, len(candidates)), target))
+            if not scored:
+                raise NoHealthyWorkerError("no healthy GB300 worker is available")
+            target = min(scored)[2]
+            self._local_inflight[target] = self._local_inflight.get(target, 0) + 1
+            return target
+
+    def release(self, target: str) -> None:
+        """Release one assignment previously reserved by :meth:`select`."""
+
+        with self._lock:
+            current = self._local_inflight.get(target, 0)
+            if current > 0:
+                self._local_inflight[target] = current - 1
 
     def models(self) -> list[str]:
         values = {
@@ -323,6 +338,7 @@ def create_app(
             else None
         ) or config.producer_group
         model = body.get("model") if isinstance(body.get("model"), str) else None
+        target: str | None = None
         try:
             target = await asyncio.to_thread(
                 selector.select, requested=requested_target, model=model
@@ -348,10 +364,14 @@ def create_app(
                 _openai_error(str(exc), error_type="service_unavailable"), status_code=503
             )
         except InvalidRequestError as exc:
+            if target is not None:
+                selector.release(target)
             return JSONResponse(
                 _openai_error(str(exc), error_type="invalid_request_error"), status_code=400
             )
         except Exception as exc:
+            if target is not None:
+                selector.release(target)
             log_event(LOGGER, logging.ERROR, "submit_failed", endpoint=endpoint, exc_info=True)
             return JSONResponse(_openai_error(str(exc), error_type="relay_error"), status_code=502)
 
@@ -392,6 +412,7 @@ def create_app(
                     error = json.dumps(_openai_error(str(exc), error_type="relay_error"))
                     yield f"data: {error}\n\ndata: [DONE]\n\n".encode()
                 finally:
+                    selector.release(target)
                     relay_metrics.inflight.labels("gateway", target).dec()
                     relay_metrics.requests.labels("gateway", target, endpoint, outcome).inc()
                     relay_metrics.latency.labels("gateway", target, endpoint).observe(
@@ -433,6 +454,7 @@ def create_app(
                 headers=common_headers,
             )
         finally:
+            selector.release(target)
             relay_metrics.inflight.labels("gateway", target).dec()
             relay_metrics.latency.labels("gateway", target, endpoint).observe(
                 time.monotonic() - started

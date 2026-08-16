@@ -151,9 +151,68 @@ print(response.choices[0].message.content)
 
 Standard `stream=True` calls are supported. The worker publishes the first upstream chunk immediately, then flushes by size or at a configurable interval; the gateway reconstructs the byte stream as SSE. See [`examples/`](examples) for complete calls.
 
+## YAML fleet deployment
+
+Node addresses, deployment settings, the pinned model revision, and relay tuning live in one
+YAML file. Keep only SSH passwords in `.env`; the YAML refers to each password by environment
+variable name. S3 credentials remain in a standard AWS credentials/config file and are copied
+to each worker through SFTP with mode `0600`.
+
+```bash
+cp config/fleet.example.yaml config/fleet.local.yaml
+# Edit hosts, SHA256 host-key pins, S3 profile/bucket, and enabled nodes.
+scripts/deploy-fleet.sh --node gb300-0001,gb300-0002
+```
+
+The default run is idempotent and performs the system, model, and relay stages. It installs the
+NVIDIA container runtime when missing, deploys the digest-pinned vLLM image, waits for model
+health, installs the architecture-specific checksum-verified `s5cmd`, runs the full S3 doctor,
+and starts one persistent worker per node. A newly installed GPU driver may require one reboot;
+rerun the same command afterward.
+
+The checked-in Qwen3.8 FP8 template enables MTP speculative decoding, FP8 KV cache, chunked
+prefill, prefix caching, FlashInfer FP8 vision attention, shared-memory multimodal processor
+cache, and image/video request limits. Workers use `data_uri` media delivery because their
+temporary files are not mounted into the model container.
+
+Useful variants:
+
+```bash
+# Validate selection and secrets without connecting or changing remote state.
+scripts/deploy-fleet.sh --dry-run --node gb300-0001,gb300-0002
+
+# Roll only relay code/config without restarting the model.
+scripts/deploy-fleet.sh --stage relay --node gb300-0001,gb300-0002
+
+# Deploy, then run the local OpenAI-compatible gateway in the foreground.
+scripts/deploy-fleet.sh --node gb300-0001,gb300-0002 --start-gateway
+```
+
+Without `--start-gateway`, deployment writes an ignored, mode-`0600` gateway configuration to
+`config/local-fleet-gateway.toml`. Start it later with:
+
+```bash
+.venv/bin/gb300-relay gateway --config config/local-fleet-gateway.toml
+```
+
+Run a fixed-output token throughput matrix against that unified API with:
+
+```bash
+.venv/bin/python scripts/benchmark-openai-tps.py \
+  --base-url http://127.0.0.1:18080 \
+  --model Qwen/Qwen3.8-27B-FP8 \
+  --concurrency 1,2,4,8,16,32 \
+  --output-tokens 256
+```
+
+Each JSON result reports successful requests, aggregate output tokens/second, p50/p95 latency,
+and the `x-relay-target` distribution. Warmups are excluded by default.
+
 ## Routing, deadlines, and idempotency
 
-The gateway selects a target using the aggregate `inflight / max_concurrency` reported by healthy workers. OpenAI clients can override routing and relay behavior through `extra_headers`:
+The gateway selects a target using the aggregate `inflight / max_concurrency` reported by
+healthy workers plus gateway-local reservations for requests not yet visible in the next
+heartbeat. OpenAI clients can override routing and relay behavior through `extra_headers`:
 
 ```python
 response = client.chat.completions.create(

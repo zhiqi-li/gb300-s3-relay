@@ -11,3 +11,4 @@ build/
 *.credentials
 relay-work/
 config/local-*.toml
+config/fleet.local.yaml

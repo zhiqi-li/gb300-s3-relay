@@ -233,6 +233,32 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         finally:
             store.release_refresh.set()
 
+    async def test_burst_selection_reserves_local_capacity(self) -> None:
+        layout = ObjectLayout("relay/v1")
+        for target in ("gb300-1", "gb300-2"):
+            heartbeat = WorkerHeartbeat(
+                target=target,
+                worker_id=f"{target}-worker",
+                max_concurrency=64,
+                inflight=0,
+            )
+            self.store.put_bytes(
+                layout.worker_heartbeat(target, heartbeat.worker_id),
+                canonical_json_bytes(heartbeat.model_dump(mode="json")),
+            )
+        selector = TargetSelector(
+            self.store,
+            layout,
+            GatewayConfig(targets=("gb300-1", "gb300-2")),
+        )
+
+        selected = [selector.select(model="vlm") for _ in range(32)]
+
+        self.assertEqual(selected.count("gb300-1"), 16)
+        self.assertEqual(selected.count("gb300-2"), 16)
+        for target in selected:
+            selector.release(target)
+
 
 if __name__ == "__main__":
     unittest.main()

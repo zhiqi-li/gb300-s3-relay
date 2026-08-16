@@ -26,6 +26,10 @@ dev = [
   "ruff>=0.9,<1",
 ]
 openai = ["openai>=1.50,<3"]
+fleet = [
+  "paramiko>=3.5,<4",
+  "PyYAML>=6,<7",
+]
 
 [project.scripts]
 gb300-relay = "gb300_relay.cli:main"

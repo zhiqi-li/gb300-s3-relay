@@ -2,7 +2,7 @@ version: 1
 
 fleet:
   name: gb300-production
-  deployment_parallelism: 2
+  deployment_parallelism: 4
   default_stages: [system, model, relay]
 
 ssh_defaults:
@@ -17,27 +17,55 @@ runtime:
 model:
   id: Qwen/Qwen3.8-27B-FP8
   revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
-  image: vllm/vllm-openai@sha256:4a2f33a884222f7049b983263ad9976f89452bb81affecf5b67d89ad35c1bc31
+  engine: sglang
+  # Official ARM64 CUDA 13 nightly built from image_source_commit.
+  image: lmsysorg/sglang@sha256:afd4f3cecfce05aa5b2560add2bb241c11028e055eeb3b255bdc252919511a18
+  image_source_commit: f825d729363136a2d4a4b330fa694d0b37a878fa
+  image_tag: gb300-sglang-qwen38-mrope:20260821
+  # Exact legacy container names to stop (without deleting) before claiming the GPU.
+  stop_containers: []
+  patches:
+    # PR 34154's draft-extend fix is represented by the equivalent upstream commit
+    # already present in the pinned nightly. The build runs a behavior regression.
+    draft_extend_pr: 34154
+    draft_extend_commit: 87ddbc5fc1f938ef589ea0f02c7e496e9f6fd059
+    draft_extend_equivalent_commit: eea2e5d6e5eb19bddddd9cc7e687fbbaa7397a7c
+    # PR 35744 is applied on top of the nightly and GPU-tested before rollout.
+    fused_kernel_pr: 35744
+    fused_kernel_commit: 9b2e053ce0d203b368e68e915667295aea24df32
+    fused_kernel_patch_sha256: e9ff9faf4285de94d42110660cf2b1313353b55d30b794afa7240603fa2406df
   service_name: gb300-qwen38-fp8
   container_name: gb300-qwen38-fp8
   listen_host: 127.0.0.1
   port: 8000
   cache_dir: /var/lib/gb300-models/huggingface
-  start_timeout_seconds: 3600
+  start_timeout_seconds: 7200
   tensor_parallel_size: 1
   max_model_len: 262144
-  gpu_memory_utilization: 0.92
-  kv_cache_dtype: fp8
-  mtp_tokens: 3
+  gpu_memory_utilization: 0.84
+  kv_cache_dtype: fp8_e4m3
+  max_running_requests: 128
+  cuda_graph_max_bs_decode: 128
+  chunked_prefill_size: 16384
+  tokenizer_worker_num: 6
+  # FA4 is kept for vision; trtllm_mha supports hybrid GDN with FP8 KV on GB300.
+  attention_backend: trtllm_mha
+  mtp:
+    algorithm: NEXTN
+    num_steps: 3
+    eagle_topk: 1
+    num_draft_tokens: 4
+    mamba_radix_cache_strategy: extra_buffer
   reasoning_parser: qwen3
   tool_call_parser: qwen3_coder
   multimodal:
-    encoder_tp_mode: data
-    encoder_attention_backend: FLASHINFER
-    encoder_attention_dtype: fp8
-    processor_cache_gb: 8
-    processor_cache_type: shm
-    shm_cache_max_object_size_mb: 512
+    attention_backend: fa4
+    feature_transport: cuda_ipc
+    preprocess_cache_size_mb: 8192
+    processor_workers: 4
+    io_workers: 8
+    model_loader_threads: 64
+    allreduce_fusion_backend: auto
     max_images_per_prompt: 8
     max_videos_per_prompt: 2
 
@@ -81,6 +109,8 @@ relay:
 nodes:
   - id: gb300-0001
     host: gb300-0001.example.com
+    # Old template instances to stop during a one-time node-ID migration.
+    legacy_relay_targets: []
     ssh:
       user: relay-admin
       password_env: GB300_0001_SSH_PASSWORD
@@ -89,6 +119,7 @@ nodes:
 
   - id: gb300-0002
     host: gb300-0002.example.com
+    legacy_relay_targets: []
     ssh:
       user: relay-admin
       password_env: GB300_0002_SSH_PASSWORD

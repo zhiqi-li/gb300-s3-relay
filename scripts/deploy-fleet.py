@@ -18,6 +18,8 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -29,6 +31,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SAFE_SYSTEMD_NAME = re.compile(r"^[A-Za-z0-9_.@-]+$")
 SAFE_IMAGE = re.compile(r"^[A-Za-z0-9_./:@+-]+$")
+SAFE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SAFE_GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 PRINT_LOCK = threading.Lock()
 
 
@@ -161,15 +165,27 @@ class Remote:
         effective = command
         if sudo:
             effective = "sudo -S -p '' bash -lc " + shlex.quote(command)
-        stdin, stdout, stderr = self.client.exec_command(effective, get_pty=False, timeout=timeout)
-        if sudo:
-            stdin.write(self.password + "\n")
-            stdin.flush()
-            stdin.channel.shutdown_write()
-        output = stdout.read().decode("utf-8", "replace")
-        errors = stderr.read().decode("utf-8", "replace")
-        status = stdout.channel.recv_exit_status()
-        combined = redact(output + errors, self.secrets)
+        transport = self.client.get_transport()
+        if transport is None:
+            raise DeploymentError(f"{self.node['id']}: SSH transport is unavailable")
+        channel = transport.open_session(timeout=timeout)
+        channel.settimeout(timeout)
+        channel.set_combine_stderr(True)
+        channel.exec_command(effective)
+        stdin = channel.makefile_stdin("wb")
+        stdout = channel.makefile("rb")
+        try:
+            if sudo:
+                stdin.write((self.password + "\n").encode())
+                stdin.flush()
+                channel.shutdown_write()
+            output = stdout.read().decode("utf-8", "replace")
+            status = channel.recv_exit_status()
+        finally:
+            stdin.close()
+            stdout.close()
+            channel.close()
+        combined = redact(output, self.secrets)
         if check and status:
             raise DeploymentError(
                 f"{self.node['id']}: remote command failed ({status}): {combined[-5000:]}"
@@ -210,8 +226,40 @@ def model_values(spec: dict[str, Any]) -> dict[str, Any]:
     container = str(model.get("container_name", service))
     if not SAFE_SYSTEMD_NAME.fullmatch(service) or not SAFE_SYSTEMD_NAME.fullmatch(container):
         raise DeploymentError("model service/container name contains unsafe characters")
+    engine = str(model.get("engine", "sglang"))
+    if engine != "sglang":
+        raise DeploymentError(f"only the sglang model engine is supported, got {engine!r}")
+    image_tag = str(model.get("image_tag", "gb300-sglang-qwen38-mrope:latest"))
+    if not SAFE_IMAGE.fullmatch(image_tag):
+        raise DeploymentError("model.image_tag contains unsafe characters")
+    patches = model.get("patches")
+    if not isinstance(patches, dict):
+        raise DeploymentError("model.patches must define the pinned SGLang fixes")
+    for key in (
+        "draft_extend_commit",
+        "draft_extend_equivalent_commit",
+        "fused_kernel_commit",
+    ):
+        if not SAFE_GIT_COMMIT.fullmatch(str(patches.get(key, ""))):
+            raise DeploymentError(f"model.patches.{key} must be a full git commit")
+    if not SAFE_SHA256.fullmatch(str(patches.get("fused_kernel_patch_sha256", ""))):
+        raise DeploymentError("model.patches.fused_kernel_patch_sha256 must be SHA-256")
+    if not SAFE_GIT_COMMIT.fullmatch(str(model.get("image_source_commit", ""))):
+        raise DeploymentError("model.image_source_commit must be a full git commit")
+    if "@sha256:" not in str(model["image"]):
+        raise DeploymentError("model.image must be pinned by digest")
+    mtp = model.get("mtp")
+    if not isinstance(mtp, dict):
+        raise DeploymentError("model.mtp must be a mapping")
+    stop_containers = model.get("stop_containers", [])
+    if not isinstance(stop_containers, list) or any(
+        not SAFE_SYSTEMD_NAME.fullmatch(str(name)) for name in stop_containers
+    ):
+        raise DeploymentError("model.stop_containers must contain only exact container names")
     return {
         **model,
+        "engine": engine,
+        "image_tag": image_tag,
         "service_name": service,
         "container_name": container,
         "listen_host": str(model.get("listen_host", "127.0.0.1")),
@@ -219,57 +267,181 @@ def model_values(spec: dict[str, Any]) -> dict[str, Any]:
         "max_model_len": int(model.get("max_model_len", 262_144)),
         "gpu_memory_utilization": float(model.get("gpu_memory_utilization", 0.92)),
         "kv_cache_dtype": str(model.get("kv_cache_dtype", "fp8")),
-        "mtp_tokens": int(model.get("mtp_tokens", 3)),
+        "mtp": mtp,
+        "stop_containers": [str(name) for name in stop_containers],
     }
 
 
-def render_vllm_config(spec: dict[str, Any]) -> bytes:
+def render_sglang_args(spec: dict[str, Any]) -> list[str]:
     model = model_values(spec)
+    mtp = model["mtp"]
     multimodal = model.get("multimodal", {})
-    raw: dict[str, Any] = {
-        "revision": str(model["revision"]),
-        "tokenizer-revision": str(model["revision"]),
-        "served-model-name": [str(model["id"])],
-        "host": model["listen_host"],
-        "port": model["port"],
-        "tensor-parallel-size": int(model.get("tensor_parallel_size", 1)),
-        "max-model-len": model["max_model_len"],
-        "kv-cache-dtype": model["kv_cache_dtype"],
-        "gpu-memory-utilization": model["gpu_memory_utilization"],
-        "enable-chunked-prefill": True,
-        "enable-prefix-caching": True,
-        "reasoning-parser": str(model.get("reasoning_parser", "qwen3")),
-        "enable-auto-tool-choice": True,
-        "tool-call-parser": str(model.get("tool_call_parser", "qwen3_coder")),
-        "speculative-config": {
-            "method": "mtp",
-            "num_speculative_tokens": model["mtp_tokens"],
-            "revision": str(model["revision"]),
-        },
-        "mm-encoder-tp-mode": str(multimodal.get("encoder_tp_mode", "data")),
-        "mm-encoder-attn-backend": str(multimodal.get("encoder_attention_backend", "FLASHINFER")),
-        "mm-encoder-attn-dtype": str(multimodal.get("encoder_attention_dtype", "fp8")),
-        "mm-processor-cache-gb": int(multimodal.get("processor_cache_gb", 8)),
-        "mm-processor-cache-type": str(multimodal.get("processor_cache_type", "shm")),
-        "mm-shm-cache-max-object-size-mb": int(multimodal.get("shm_cache_max_object_size_mb", 512)),
-        "limit-mm-per-prompt": {
+    limits = json.dumps(
+        {
             "image": int(multimodal.get("max_images_per_prompt", 8)),
             "video": int(multimodal.get("max_videos_per_prompt", 2)),
         },
-        "enable-request-id-headers": True,
-        "enable-server-load-tracking": True,
-        "disable-uvicorn-access-log": True,
-        "uvicorn-log-level": "info",
-    }
-    return yaml.safe_dump(raw, sort_keys=False, allow_unicode=True).encode()
+        separators=(",", ":"),
+    )
+    loader = json.dumps(
+        {
+            "enable_multithread_load": True,
+            "num_threads": int(multimodal.get("model_loader_threads", 64)),
+        },
+        separators=(",", ":"),
+    )
+    return [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        str(model["id"]),
+        "--revision",
+        str(model["revision"]),
+        "--served-model-name",
+        str(model["id"]),
+        "--host",
+        model["listen_host"],
+        "--port",
+        str(model["port"]),
+        "--tp",
+        str(int(model.get("tensor_parallel_size", 1))),
+        "--context-length",
+        str(model["max_model_len"]),
+        "--mem-fraction-static",
+        str(model["gpu_memory_utilization"]),
+        "--kv-cache-dtype",
+        model["kv_cache_dtype"],
+        "--max-running-requests",
+        str(int(model.get("max_running_requests", 128))),
+        "--cuda-graph-max-bs-decode",
+        str(int(model.get("cuda_graph_max_bs_decode", 128))),
+        "--chunked-prefill-size",
+        str(int(model.get("chunked_prefill_size", 16_384))),
+        "--tokenizer-worker-num",
+        str(int(model.get("tokenizer_worker_num", 6))),
+        "--attention-backend",
+        str(model.get("attention_backend", "flashinfer")),
+        "--reasoning-parser",
+        str(model.get("reasoning_parser", "qwen3")),
+        "--tool-call-parser",
+        str(model.get("tool_call_parser", "qwen3_coder")),
+        "--speculative-algorithm",
+        str(mtp.get("algorithm", "NEXTN")),
+        "--speculative-num-steps",
+        str(int(mtp.get("num_steps", 3))),
+        "--speculative-eagle-topk",
+        str(int(mtp.get("eagle_topk", 1))),
+        "--speculative-num-draft-tokens",
+        str(int(mtp.get("num_draft_tokens", 4))),
+        "--mamba-radix-cache-strategy",
+        str(mtp.get("mamba_radix_cache_strategy", "extra_buffer")),
+        "--mm-attention-backend",
+        str(multimodal.get("attention_backend", "fa4")),
+        "--mm-feature-transport",
+        str(multimodal.get("feature_transport", "cuda_ipc")),
+        "--mm-preprocess-cache-size-mb",
+        str(int(multimodal.get("preprocess_cache_size_mb", 8192))),
+        "--mm-processor-worker-num",
+        str(int(multimodal.get("processor_workers", 4))),
+        "--mm-io-worker-num",
+        str(int(multimodal.get("io_workers", 8))),
+        "--limit-mm-data-per-request",
+        limits,
+        "--model-loader-extra-config",
+        loader,
+        "--enable-multimodal",
+        "--enable-metrics",
+        "--flashinfer-allreduce-fusion-backend",
+        str(multimodal.get("allreduce_fusion_backend", "auto")),
+        "--trust-remote-code",
+    ]
+
+
+def render_sglang_verify_script() -> bytes:
+    return b'''from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+batch_size = 3
+draft_tokens = 4
+forward_batch = ForwardBatch.__new__(ForwardBatch)
+forward_batch.seq_lens = torch.full((batch_size,), 32, dtype=torch.int64)
+multimodal_inputs = [
+    SimpleNamespace(mrope_position_delta=torch.tensor([[5]], dtype=torch.int64))
+    for _ in range(batch_size)
+]
+batch = SimpleNamespace(multimodal_inputs=multimodal_inputs)
+seq_positions = torch.arange(batch_size * draft_tokens, dtype=torch.int64)
+forward_batch.compute_spec_mrope_positions(
+    SimpleNamespace(device=torch.device("cpu")), batch, seq_positions=seq_positions
+)
+assert forward_batch.mrope_positions.shape == (3, batch_size * draft_tokens)
+expected = (seq_positions.view(batch_size, draft_tokens) + 5).flatten()
+for axis in range(3):
+    assert torch.equal(forward_batch.mrope_positions[axis], expected)
+print("draft_extend_mrope=ok")
+'''
+
+
+def render_sglang_dockerfile(spec: dict[str, Any]) -> bytes:
+    model = model_values(spec)
+    patches = model["patches"]
+    lines = [
+        f"FROM {model['image']}",
+        "COPY fused-kernel.patch /tmp/fused-kernel.patch",
+        "COPY verify-draft-mrope.py /tmp/verify-draft-mrope.py",
+        "RUN cd /sgl-workspace/sglang && "
+        "git apply --check /tmp/fused-kernel.patch && "
+        "git apply /tmp/fused-kernel.patch && "
+        "python3 -m py_compile "
+        "python/sglang/kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py "
+        "python/sglang/srt/models/qwen3_5.py && "
+        "python3 /tmp/verify-draft-mrope.py && "
+        "rm -f /tmp/fused-kernel.patch /tmp/verify-draft-mrope.py",
+        "LABEL "
+        f'ai.sglang.base.commit="{model["image_source_commit"]}" '
+        f'ai.sglang.fix.draft_extend_pr="{patches["draft_extend_pr"]}" '
+        f'ai.sglang.fix.draft_extend_commit="{patches["draft_extend_commit"]}" '
+        f'ai.sglang.fix.draft_extend_equivalent_commit="{patches["draft_extend_equivalent_commit"]}" '
+        f'ai.sglang.fix.fused_kernel_pr="{patches["fused_kernel_pr"]}" '
+        f'ai.sglang.fix.fused_kernel_commit="{patches["fused_kernel_commit"]}"',
+        "",
+    ]
+    return "\n".join(lines).encode()
+
+
+def fetch_sglang_fused_patch(spec: dict[str, Any]) -> bytes:
+    model = model_values(spec)
+    patches = model["patches"]
+    commit = str(patches["fused_kernel_commit"])
+    url = f"https://github.com/sgl-project/sglang/commit/{commit}.patch"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = response.read(8 * 1024 * 1024 + 1)
+    except (OSError, urllib.error.URLError) as exc:
+        raise DeploymentError(f"unable to download pinned SGLang patch {commit}: {exc}") from exc
+    if len(data) > 8 * 1024 * 1024:
+        raise DeploymentError(f"SGLang patch {commit} exceeds the 8 MiB limit")
+    actual = hashlib.sha256(data).hexdigest()
+    expected = str(patches["fused_kernel_patch_sha256"])
+    if actual != expected:
+        raise DeploymentError(
+            f"SGLang patch {commit} checksum mismatch: expected {expected}, got {actual}"
+        )
+    return data
 
 
 def render_model_unit(spec: dict[str, Any]) -> bytes:
     model = model_values(spec)
     cache_dir = str(model.get("cache_dir", "/var/lib/gb300-models/huggingface"))
+    container_command = shlex.join(render_sglang_args(spec))
     lines = [
         "[Unit]",
-        f"Description=GB300 {model['id']} vLLM service",
+        f"Description=GB300 {model['id']} SGLang service",
         "After=docker.service network-online.target",
         "Wants=network-online.target",
         "Requires=docker.service",
@@ -281,10 +453,9 @@ def render_model_unit(spec: dict[str, Any]) -> bytes:
         f"--name {model['container_name']} --pull never --gpus all --network host --ipc host "
         "--ulimit memlock=-1 --ulimit stack=67108864 "
         "-e HF_HOME=/root/.cache/huggingface -e HF_XET_HIGH_PERFORMANCE=1 "
-        "-e HF_HUB_DISABLE_TELEMETRY=1 -e VLLM_NO_USAGE_STATS=1 "
+        "-e HF_HUB_DISABLE_TELEMETRY=1 -e SGLANG_USE_CUDA_IPC_TRANSPORT=1 "
         f"-v {cache_dir}:/root/.cache/huggingface "
-        "-v /etc/gb300-model:/etc/gb300-model:ro "
-        f"{model['image']} {model['id']} --config /etc/gb300-model/vllm.yaml",
+        f"{model['image_tag']} {container_command}",
         f"ExecStop=-/usr/bin/docker stop --timeout 180 {model['container_name']}",
         "Restart=on-failure",
         "RestartSec=15",
@@ -476,6 +647,7 @@ def bootstrap_system(remote: Remote, spec: dict[str, Any]) -> None:
         "command -v docker >/dev/null && docker info >/dev/null 2>&1 && "
         "command -v nvidia-ctk >/dev/null && "
         "docker info --format '{{json .Runtimes}}' | grep -q nvidia",
+        sudo=True,
         check=False,
     )
     if status == 0:
@@ -493,8 +665,18 @@ def bootstrap_system(remote: Remote, spec: dict[str, Any]) -> None:
     command = f"""
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y ca-certificates curl gnupg python3 {driver_package} {docker_package}
+packages=()
+command -v curl >/dev/null 2>&1 || packages+=(curl)
+command -v gpg >/dev/null 2>&1 || packages+=(gnupg)
+command -v python3 >/dev/null 2>&1 || packages+=(python3)
+command -v docker >/dev/null 2>&1 || packages+=({docker_package})
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+  packages+=({driver_package})
+fi
+if [ "${{#packages[@]}}" -gt 0 ]; then
+  apt-get update
+  apt-get install -y ca-certificates "${{packages[@]}}"
+fi
 if ! command -v nvidia-ctk >/dev/null 2>&1; then
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
   curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' > /etc/apt/sources.list.d/nvidia-container-toolkit.list
@@ -502,8 +684,10 @@ if ! command -v nvidia-ctk >/dev/null 2>&1; then
   apt-get install -y {toolkit_package}
 fi
 systemctl enable --now docker
-nvidia-ctk runtime configure --runtime=docker
-systemctl restart docker
+if ! docker info --format '{{{{json .Runtimes}}}}' | grep -q nvidia; then
+  nvidia-ctk runtime configure --runtime=docker
+  systemctl restart docker
+fi
 if ! nvidia-smi >/dev/null 2>&1; then
   echo 'NVIDIA driver was installed but is not loaded; reboot this node and rerun deployment' >&2
   exit 42
@@ -514,49 +698,95 @@ docker info --format '{{{{json .Runtimes}}}}' | grep -q nvidia
     remote.run(command, sudo=True, timeout=1800)
 
 
-def deploy_model(remote: Remote, spec: dict[str, Any]) -> None:
+def deploy_model(remote: Remote, spec: dict[str, Any], fused_patch: bytes) -> None:
     node_id = str(remote.node["id"])
     model = model_values(spec)
     tag = uuid.uuid4().hex
-    temp_config = f"/tmp/gb300-model-config-{tag}.yaml"
+    build_context = f"/tmp/gb300-sglang-build-{tag}"
     temp_unit = f"/tmp/gb300-model-unit-{tag}.service"
-    remote.upload_bytes(render_vllm_config(spec), temp_config)
+    remote.run(f"install -d -m 0700 {shlex.quote(build_context)}")
+    remote.upload_bytes(fused_patch, f"{build_context}/fused-kernel.patch")
+    remote.upload_bytes(
+        render_sglang_verify_script(), f"{build_context}/verify-draft-mrope.py"
+    )
+    remote.upload_bytes(render_sglang_dockerfile(spec), f"{build_context}/Dockerfile")
     remote.upload_bytes(render_model_unit(spec), temp_unit, 0o644)
     service = f"{model['service_name']}.service"
     cache_dir = str(model.get("cache_dir", "/var/lib/gb300-models/huggingface"))
     timeout = int(model.get("start_timeout_seconds", 3600))
     attempts = max(1, math.ceil(timeout / 5))
-    announce(node_id, "deploying pinned vLLM model service")
-    command = f"""
+    patches = model["patches"]
+    fused_commit = str(patches["fused_kernel_commit"])
+    announce(node_id, "building pinned SGLang image with mRoPE fixes")
+    build_command = f"""
 set -euo pipefail
 install -d -o root -g root -m 0755 /etc/gb300-model {shlex.quote(cache_dir)}
-changed=0
-cmp -s {shlex.quote(temp_config)} /etc/gb300-model/vllm.yaml || changed=1
-cmp -s {shlex.quote(temp_unit)} /etc/systemd/system/{shlex.quote(service)} || changed=1
 docker image inspect {shlex.quote(str(model["image"]))} >/dev/null 2>&1 || docker pull {shlex.quote(str(model["image"]))}
-install -o root -g root -m 0644 {shlex.quote(temp_config)} /etc/gb300-model/vllm.yaml
+if ! docker image inspect --format '{{{{index .Config.Labels "ai.sglang.fix.fused_kernel_commit"}}}}' {shlex.quote(str(model["image_tag"]))} 2>/dev/null | grep -Fxq {shlex.quote(fused_commit)}; then
+  docker build --pull=false --tag {shlex.quote(str(model["image_tag"]))} {shlex.quote(build_context)}
+fi
+rm -rf {shlex.quote(build_context)}
+"""
+    remote.run(build_command, sudo=True, timeout=3600)
+
+    if model["stop_containers"]:
+        announce(node_id, "stopping configured legacy model stack")
+        legacy_names = " ".join(shlex.quote(name) for name in model["stop_containers"])
+        remote.run(
+            "for name in "
+            + legacy_names
+            + "; do docker container inspect \"$name\" >/dev/null 2>&1 && "
+            + "docker stop --timeout 180 \"$name\" || true; done",
+            sudo=True,
+            timeout=900,
+        )
+
+    announce(node_id, "GPU-testing fused mRoPE kernel patch")
+    remote.run(f"systemctl stop {shlex.quote(service)}", sudo=True, check=False, timeout=300)
+    test_command = (
+        "docker run --rm --gpus all --ipc host "
+        f"{shlex.quote(str(model['image_tag']))} bash -lc "
+        + shlex.quote(
+            "cd /sgl-workspace/sglang/test && "
+            "python3 registered/kernels/ops/attention/"
+            "test_fused_qk_rmsnorm_rope_gate.py"
+        )
+    )
+    test_status, test_output = remote.run(
+        test_command, sudo=True, check=False, timeout=1200
+    )
+    if test_status:
+        remote.run(f"systemctl start {shlex.quote(service)}", sudo=True, check=False)
+        raise DeploymentError(
+            f"{node_id}: fused mRoPE GPU regression failed: {test_output[-5000:]}"
+        )
+
+    announce(node_id, "starting SGLang model service")
+    install_command = f"""
+set -euo pipefail
 install -o root -g root -m 0644 {shlex.quote(temp_unit)} /etc/systemd/system/{shlex.quote(service)}
-rm -f {shlex.quote(temp_config)} {shlex.quote(temp_unit)}
+rm -f {shlex.quote(temp_unit)}
 systemctl daemon-reload
 systemctl enable {shlex.quote(service)}
-if [ "$changed" -eq 1 ] || ! systemctl is-active --quiet {shlex.quote(service)}; then
-  systemctl restart {shlex.quote(service)}
-fi
+systemctl restart {shlex.quote(service)}
 for attempt in $(seq 1 {attempts}); do
   if curl -fsS http://127.0.0.1:{model["port"]}/health >/dev/null; then
+    curl -fsS http://127.0.0.1:{model["port"]}/v1/models | grep -Fq {shlex.quote(str(model["id"]))}
     exit 0
   fi
   if ! systemctl is-active --quiet {shlex.quote(service)}; then
     systemctl status --no-pager {shlex.quote(service)} || true
+    journalctl -u {shlex.quote(service)} --no-pager -n 200 || true
     exit 1
   fi
   sleep 5
 done
-echo 'timed out waiting for the vLLM health endpoint' >&2
+echo 'timed out waiting for the SGLang health endpoint' >&2
+journalctl -u {shlex.quote(service)} --no-pager -n 200 || true
 exit 1
 """
-    remote.run(command, sudo=True, timeout=timeout + 600)
-    announce(node_id, "model ready")
+    remote.run(install_command, sudo=True, timeout=timeout + 600)
+    announce(node_id, "SGLang model ready")
 
 
 def deploy_relay(
@@ -568,6 +798,20 @@ def deploy_relay(
     run_smoke: bool,
 ) -> None:
     node_id = str(remote.node["id"])
+    legacy_targets = remote.node.get("legacy_relay_targets", [])
+    if not isinstance(legacy_targets, list):
+        raise DeploymentError(f"{node_id}: legacy_relay_targets must be a list")
+    legacy_services: list[str] = []
+    for target in legacy_targets:
+        target_name = str(target)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", target_name):
+            raise DeploymentError(f"{node_id}: invalid legacy relay target: {target_name!r}")
+        if target_name != node_id and target_name not in legacy_services:
+            legacy_services.append(target_name)
+    legacy_disable = "\n".join(
+        f"systemctl disable --now {shlex.quote(f'gb300-relay-worker@{target}.service')} || true"
+        for target in legacy_services
+    )
     tag = uuid.uuid4().hex
     paths = {
         "archive": f"/tmp/gb300-relay-source-{tag}.tar.gz",
@@ -620,6 +864,7 @@ install -o root -g gb300-relay -m 0640 {shlex.quote(paths["config"])} /etc/gb300
 install -o root -g root -m 0644 {shlex.quote(paths["unit"])} /etc/systemd/system/gb300-relay-worker@.service
 rm -f {shlex.quote(paths["archive"])} {shlex.quote(paths["credentials"])} {shlex.quote(paths["config"])} {shlex.quote(paths["unit"])}
 systemctl daemon-reload
+{legacy_disable}
 """
     remote.run(command, sudo=True, timeout=1800)
     if run_smoke:
@@ -630,15 +875,30 @@ systemctl daemon-reload
             sudo=True,
             timeout=900,
         )
+    service = f"gb300-relay-worker@{node_id}.service"
     remote.run(
-        f"systemctl enable gb300-relay-worker@{node_id}.service && "
-        f"systemctl restart gb300-relay-worker@{node_id}.service",
+        f"systemctl enable {shlex.quote(service)} && "
+        f"systemctl restart {shlex.quote(service)}",
         sudo=True,
     )
+    metrics_port = int(spec.get("relay", {}).get("worker", {}).get("metrics_port", 9108))
+    ready_command = f"""
+set -euo pipefail
+service={shlex.quote(service)}
+check_ready() {{
+  systemctl is-active --quiet "$service"
+  main_pid=$(systemctl show --property MainPID --value "$service")
+  test "$main_pid" -gt 1
+  ss -ltnp 'sport = :{metrics_port}' | grep -Fq "pid=$main_pid,"
+  curl -fsS http://127.0.0.1:{metrics_port}/metrics >/dev/null
+}}
+check_ready
+sleep 3
+check_ready
+"""
     for _ in range(30):
         status, _ = remote.run(
-            f"systemctl is-active --quiet gb300-relay-worker@{node_id}.service && "
-            "curl -fsS http://127.0.0.1:9108/metrics >/dev/null",
+            ready_command,
             sudo=True,
             check=False,
         )
@@ -724,6 +984,7 @@ def main() -> int:
     credentials_path: Path | None = None
     if "relay" in stages or args.start_gateway:
         credentials, credentials_path = read_s3_credentials(spec)
+    fused_patch = fetch_sglang_fused_patch(spec) if "model" in stages else None
 
     print(
         "deployment_plan="
@@ -732,6 +993,7 @@ def main() -> int:
                 "nodes": [node["id"] for node in nodes],
                 "stages": sorted(stages),
                 "model": spec["model"]["id"],
+                "engine": model_values(spec)["engine"],
                 "dry_run": args.dry_run,
             },
             separators=(",", ":"),
@@ -761,7 +1023,9 @@ def main() -> int:
             if "system" in stages:
                 bootstrap_system(remote, spec)
             if "model" in stages:
-                deploy_model(remote, spec)
+                if fused_patch is None:
+                    raise DeploymentError("SGLang fused-kernel patch was not prepared")
+                deploy_model(remote, spec, fused_patch)
             if "relay" in stages:
                 if archive_path is None or credentials is None:
                     raise DeploymentError("relay deployment inputs were not prepared")

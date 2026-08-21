@@ -165,13 +165,16 @@ scripts/deploy-fleet.sh --node gb300-0001,gb300-0002
 ```
 
 The default run is idempotent and performs the system, model, and relay stages. It installs the
-NVIDIA container runtime when missing, deploys the digest-pinned vLLM image, waits for model
-health, installs the architecture-specific checksum-verified `s5cmd`, runs the full S3 doctor,
-and starts one persistent worker per node. A newly installed GPU driver may require one reboot;
-rerun the same command afterward.
+NVIDIA container runtime when missing, builds a locally tagged SGLang image from a digest-pinned
+ARM64 base, applies the checksum-pinned fused mRoPE kernel fix, verifies the draft-extend mRoPE
+behavior, and runs the fused-kernel GPU regression before replacing the model service. It then
+waits for model health, installs the architecture-specific checksum-verified `s5cmd`, runs the
+full S3 doctor, and starts one persistent worker per node. A newly installed GPU driver may
+require one reboot; rerun the same command afterward.
 
-The checked-in Qwen3.8 FP8 template enables MTP speculative decoding, FP8 KV cache, chunked
-prefill, prefix caching, FlashInfer FP8 vision attention, shared-memory multimodal processor
+The checked-in Qwen3.8 FP8 template enables built-in NEXTN MTP speculative decoding, FP8 KV
+cache, chunked prefill, FlashInfer attention and all-reduce fusion, FA4 vision attention, CUDA
+IPC multimodal feature transport, parallel media processing and loading, multimodal preprocess
 cache, and image/video request limits. Workers use `data_uri` media delivery because their
 temporary files are not mounted into the model container.
 

@@ -29,6 +29,7 @@ import paramiko
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+TP1_SAMPLER_PATCH = ROOT / "patches/sglang-tp1-sampler-grammar-sync.patch"
 SAFE_SYSTEMD_NAME = re.compile(r"^[A-Za-z0-9_.@-]+$")
 SAFE_IMAGE = re.compile(r"^[A-Za-z0-9_./:@+-]+$")
 SAFE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -393,22 +394,28 @@ def render_sglang_dockerfile(spec: dict[str, Any]) -> bytes:
     lines = [
         f"FROM {model['image']}",
         "COPY fused-kernel.patch /tmp/fused-kernel.patch",
+        "COPY tp1-sampler-grammar-sync.patch /tmp/tp1-sampler-grammar-sync.patch",
         "COPY verify-draft-mrope.py /tmp/verify-draft-mrope.py",
         "RUN cd /sgl-workspace/sglang && "
         "git apply --check /tmp/fused-kernel.patch && "
         "git apply /tmp/fused-kernel.patch && "
+        "git apply --check /tmp/tp1-sampler-grammar-sync.patch && "
+        "git apply /tmp/tp1-sampler-grammar-sync.patch && "
         "python3 -m py_compile "
+        "python/sglang/srt/layers/sampler.py "
         "python/sglang/kernels/ops/attention/fused_qk_rmsnorm_rope_gate.py "
         "python/sglang/srt/models/qwen3_5.py && "
         "python3 /tmp/verify-draft-mrope.py && "
-        "rm -f /tmp/fused-kernel.patch /tmp/verify-draft-mrope.py",
+        "rm -f /tmp/fused-kernel.patch /tmp/tp1-sampler-grammar-sync.patch "
+        "/tmp/verify-draft-mrope.py",
         "LABEL "
         f'ai.sglang.base.commit="{model["image_source_commit"]}" '
         f'ai.sglang.fix.draft_extend_pr="{patches["draft_extend_pr"]}" '
         f'ai.sglang.fix.draft_extend_commit="{patches["draft_extend_commit"]}" '
         f'ai.sglang.fix.draft_extend_equivalent_commit="{patches["draft_extend_equivalent_commit"]}" '
         f'ai.sglang.fix.fused_kernel_pr="{patches["fused_kernel_pr"]}" '
-        f'ai.sglang.fix.fused_kernel_commit="{patches["fused_kernel_commit"]}"',
+        f'ai.sglang.fix.fused_kernel_commit="{patches["fused_kernel_commit"]}" '
+        'ai.sglang.fix.tp1_sampler_grammar_sync="1"',
         "",
     ]
     return "\n".join(lines).encode()
@@ -706,6 +713,10 @@ def deploy_model(remote: Remote, spec: dict[str, Any], fused_patch: bytes) -> No
     temp_unit = f"/tmp/gb300-model-unit-{tag}.service"
     remote.run(f"install -d -m 0700 {shlex.quote(build_context)}")
     remote.upload_bytes(fused_patch, f"{build_context}/fused-kernel.patch")
+    remote.upload_file(
+        TP1_SAMPLER_PATCH,
+        f"{build_context}/tp1-sampler-grammar-sync.patch",
+    )
     remote.upload_bytes(
         render_sglang_verify_script(), f"{build_context}/verify-draft-mrope.py"
     )
@@ -722,7 +733,8 @@ def deploy_model(remote: Remote, spec: dict[str, Any], fused_patch: bytes) -> No
 set -euo pipefail
 install -d -o root -g root -m 0755 /etc/gb300-model {shlex.quote(cache_dir)}
 docker image inspect {shlex.quote(str(model["image"]))} >/dev/null 2>&1 || docker pull {shlex.quote(str(model["image"]))}
-if ! docker image inspect --format '{{{{index .Config.Labels "ai.sglang.fix.fused_kernel_commit"}}}}' {shlex.quote(str(model["image_tag"]))} 2>/dev/null | grep -Fxq {shlex.quote(fused_commit)}; then
+if ! docker image inspect --format '{{{{index .Config.Labels "ai.sglang.fix.fused_kernel_commit"}}}}' {shlex.quote(str(model["image_tag"]))} 2>/dev/null | grep -Fxq {shlex.quote(fused_commit)} ||
+   ! docker image inspect --format '{{{{index .Config.Labels "ai.sglang.fix.tp1_sampler_grammar_sync"}}}}' {shlex.quote(str(model["image_tag"]))} 2>/dev/null | grep -Fxq 1; then
   docker build --pull=false --tag {shlex.quote(str(model["image_tag"]))} {shlex.quote(build_context)}
 fi
 rm -rf {shlex.quote(build_context)}

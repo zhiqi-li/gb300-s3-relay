@@ -67,7 +67,8 @@ model:
     model_loader_threads: 64
     allreduce_fusion_backend: auto
     max_images_per_prompt: 8
-    max_videos_per_prompt: 2
+    # RoboDojo recent_video_turns=5 retains an anchor plus up to five videos.
+    max_videos_per_prompt: 8
 
 relay:
   enabled: true

@@ -280,7 +280,7 @@ def render_sglang_args(spec: dict[str, Any]) -> list[str]:
     limits = json.dumps(
         {
             "image": int(multimodal.get("max_images_per_prompt", 8)),
-            "video": int(multimodal.get("max_videos_per_prompt", 2)),
+            "video": int(multimodal.get("max_videos_per_prompt", 8)),
         },
         separators=(",", ":"),
     )

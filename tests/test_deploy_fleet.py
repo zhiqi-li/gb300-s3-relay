@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import yaml
@@ -49,6 +50,10 @@ def test_sglang_args_enable_vision_and_mtp_optimizations() -> None:
     assert "--enable-metrics" in args
     assert "--flashinfer-allreduce-fusion-backend auto" in joined
     assert "--enable-flashinfer-allreduce-fusion" not in args
+
+    limits_index = args.index("--limit-mm-data-per-request") + 1
+    limits = json.loads(args[limits_index])
+    assert limits["video"] >= 6
 
 
 def test_sglang_image_applies_runtime_patches_and_records_fixes() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import yaml
@@ -50,14 +51,22 @@ def test_sglang_args_enable_vision_and_mtp_optimizations() -> None:
     assert "--flashinfer-allreduce-fusion-backend auto" in joined
     assert "--enable-flashinfer-allreduce-fusion" not in args
 
+    limits_index = args.index("--limit-mm-data-per-request") + 1
+    limits = json.loads(args[limits_index])
+    assert limits["video"] >= 6
 
-def test_sglang_image_applies_fused_patch_and_records_both_fixes() -> None:
+
+def test_sglang_image_applies_runtime_patches_and_records_fixes() -> None:
     dockerfile = deploy_fleet.render_sglang_dockerfile(fleet_spec()).decode()
+    source = (ROOT / "scripts/deploy-fleet.py").read_text()
 
     assert "git apply --check /tmp/fused-kernel.patch" in dockerfile
+    assert "git apply --check /tmp/tp1-sampler-grammar-sync.patch" in dockerfile
     assert "python3 /tmp/verify-draft-mrope.py" in dockerfile
     assert 'ai.sglang.fix.draft_extend_pr="34154"' in dockerfile
     assert 'ai.sglang.fix.fused_kernel_pr="35744"' in dockerfile
+    assert 'ai.sglang.fix.tp1_sampler_grammar_sync="1"' in dockerfile
+    assert source.count('ai.sglang.fix.tp1_sampler_grammar_sync') >= 2
 
 
 def test_model_unit_runs_only_the_patched_sglang_image() -> None:
